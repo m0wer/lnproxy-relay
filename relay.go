@@ -56,7 +56,7 @@ func NewRelay(ln lnc.LN) *Relay {
 			CltvDeltaBeta:      42,
 			// Should be set to at most the node's `--max-cltv-expiry` setting (default: 2016)
 			MaxCltvExpiry: 1800,
-			MinCltvExpiry: 200,
+			MinCltvExpiry: 420,
 			// Should be set so that CltvDeltaAlpha blocks are very unlikely to be added before timeout
 			PaymentTimeout:        60,
 			PaymentTimePreference: 0.9,
@@ -104,16 +104,19 @@ func (relay *Relay) wrap(x ProxyParameters) (proxy_invoice_params *lnc.InvoicePa
 
 	min_fee_budget_msat, min_cltv_delta, err := relay.LN.EstimateRoutingFee(*p, 0)
 	if err != nil {
-		log.Println("route estimation error:", err)
-		return nil, 0, errors.Join(ClientFacing, errors.New("could not find route"))
+		// log.Println("route estimation error:", err)
+		// return nil, 0, errors.Join(ClientFacing, errors.New("could not find route"))
+		min_fee_budget_msat = 1000
+		min_cltv_delta = 144
 	}
 	for flag, _ := range p.Features {
 		switch flag {
-		case "8", "9", "14", "15", "16", "17", "25", "48", "49", "149", "151":
+		case "8", "9", "14", "15", "16", "17", "25", "48", "49", "149", "151", "262":
 			// 25 is route blinding
 			// 48/49 is payment metadata
 			// 148/149 is trampoline routing
 			// 150/151 is electrum's trampoline
+			// 262/263 is bolt11 blinded paths
 		default:
 			return nil, 0, errors.Join(ClientFacing, fmt.Errorf("unknown feature flag: %s", flag))
 		}
