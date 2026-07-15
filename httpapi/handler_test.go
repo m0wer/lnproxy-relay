@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lnproxy/lnproxy-relay/nostr"
 )
@@ -146,4 +147,48 @@ func TestHandlerBoundsConcurrentRequests(t *testing.T) {
 	}
 	close(wrapper.release)
 	<-firstDone
+}
+
+func TestHandlerRateLimitsDirectRequests(t *testing.T) {
+	handler := NewHandlerWithOptions(&recordingWrapper{}, Options{
+		MinRequestInterval: time.Hour,
+		RequestBurst:       1,
+	})
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/spec", strings.NewReader(`{"invoice":"first"}`)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/spec", strings.NewReader(`{"invoice":"second"}`)))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want %d", second.Code, http.StatusTooManyRequests)
+	}
+	if second.Header().Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After header")
+	}
+}
+
+func TestTokenBucketRefillsWithoutLosingPartialTokens(t *testing.T) {
+	bucket := newTokenBucket(time.Second, 2)
+	now := time.Unix(1_700_000_000, 0)
+	if !bucket.allow(now) || !bucket.allow(now) {
+		t.Fatal("token bucket rejected its initial burst")
+	}
+	if bucket.allow(now) {
+		t.Fatal("token bucket exceeded its initial burst")
+	}
+	if bucket.allow(now.Add(500 * time.Millisecond)) {
+		t.Fatal("token bucket refilled a full token too early")
+	}
+	if !bucket.allow(now.Add(time.Second)) {
+		t.Fatal("token bucket lost partial refill after a denied request")
+	}
+	if bucket.allow(now.Add(1500 * time.Millisecond)) {
+		t.Fatal("token bucket allowed a request with only a partial token")
+	}
+	if !bucket.allow(now.Add(2 * time.Second)) {
+		t.Fatal("token bucket did not refill the next token")
+	}
 }

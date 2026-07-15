@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +57,24 @@ func appendUnique(values []string, value string) []string {
 	return append(values, value)
 }
 
+func envInt(key string, fallback int) (int, error) {
+	value := envOr(key, strconv.Itoa(fallback))
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
+func envDuration(key string, fallback time.Duration) (time.Duration, error) {
+	value := envOr(key, fallback.String())
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
 func main() {
 	lndHostStringFlag := flag.String("lnd", "https://127.0.0.1:8080", "host for lnd's REST api")
 	lndCertPathFlag := flag.String("lnd-cert", ".lnd/tls.cert", "lnd's self-signed cert (empty string for no-rest-tls=true)")
@@ -71,12 +90,16 @@ func main() {
 	offerIntervalFlag := flag.Duration("offer-interval", 10*time.Minute, "how often to re-publish the offer")
 	urlsFlag := flag.String("urls", "", "comma-separated direct HTTP/onion wrap endpoints to advertise (optional)")
 	httpListenFlag := flag.String("http-listen", "", "optional direct HTTP listen address, for example 127.0.0.1:4747 (or LNPROXY_HTTP_LISTEN)")
+	httpMaxConcurrentFlag := flag.Int("http-max-concurrent", 8, "maximum concurrent direct HTTP wrap handlers")
+	httpRequestIntervalFlag := flag.Duration("http-request-interval", 5*time.Second, "global interval between direct HTTP requests (0 disables)")
+	httpRequestBurstFlag := flag.Int("http-request-burst", 3, "initial and maximum direct HTTP request burst")
 
 	minMsatFlag := flag.Uint64("min-msat", 0, "minimum invoice amount in msat (0 = default/env)")
 	maxMsatFlag := flag.Uint64("max-msat", 0, "maximum invoice amount in msat (0 = default/env)")
 	baseFeeMsatFlag := flag.Uint64("base-fee-msat", 0, "relay base fee in msat (0 = default/env)")
 	feePpmFlag := flag.Uint64("fee-ppm", 0, "relay proportional fee in ppm (0 = default/env)")
 	maxExpiryFlag := flag.Uint64("max-expiry", 0, "maximum proxy invoice expiry in seconds (0 = default/env)")
+	maxActiveCircuitsFlag := flag.Uint64("max-active-circuits", 0, "maximum active hold-invoice circuits (0 = default/env)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `usage: %s [flags] lnproxy.macaroon
@@ -110,6 +133,27 @@ func main() {
 	relays := splitCSV(relaysCSV)
 	if len(relays) == 0 {
 		log.Fatalln("no nostr relays configured")
+	}
+	httpMaxConcurrent, err := envInt("LNPROXY_HTTP_MAX_CONCURRENT", *httpMaxConcurrentFlag)
+	if err != nil {
+		log.Fatalln("invalid direct HTTP concurrency:", err)
+	}
+	if httpMaxConcurrent <= 0 {
+		log.Fatalln("direct HTTP concurrency must be greater than zero")
+	}
+	httpRequestInterval, err := envDuration("LNPROXY_HTTP_REQUEST_INTERVAL", *httpRequestIntervalFlag)
+	if err != nil {
+		log.Fatalln("invalid direct HTTP request interval:", err)
+	}
+	if httpRequestInterval < 0 {
+		log.Fatalln("direct HTTP request interval must not be negative")
+	}
+	httpRequestBurst, err := envInt("LNPROXY_HTTP_REQUEST_BURST", *httpRequestBurstFlag)
+	if err != nil {
+		log.Fatalln("invalid direct HTTP request burst:", err)
+	}
+	if httpRequestBurst <= 0 {
+		log.Fatalln("direct HTTP request burst must be greater than zero")
 	}
 
 	network, err := nostr.ParseNetwork(envOr("LNPROXY_NETWORK", *networkFlag))
@@ -171,6 +215,9 @@ func main() {
 	if *maxExpiryFlag != 0 {
 		lnproxyRelay.MaxExpiry = *maxExpiryFlag
 	}
+	if *maxActiveCircuitsFlag != 0 {
+		lnproxyRelay.MaxActiveCircuits = *maxActiveCircuitsFlag
+	}
 	if err := lnproxyRelay.RelayParameters.Validate(); err != nil {
 		log.Fatalln("invalid relay configuration:", err)
 	}
@@ -182,7 +229,11 @@ func main() {
 	log.Println("nostr public key:", identity.PublicKey)
 
 	httpListen := envOr("LNPROXY_HTTP_LISTEN", *httpListenFlag)
-	urls := splitCSV(*urlsFlag)
+	urlsCSV := *urlsFlag
+	if urlsCSV == "" {
+		urlsCSV = os.Getenv("LNPROXY_URLS")
+	}
+	urls := splitCSV(urlsCSV)
 	features := splitCSV(*featuresFlag)
 	if httpListen != "" && len(urls) > 0 {
 		features = appendUnique(features, nostr.FeatureRequestIDV1)
@@ -232,17 +283,19 @@ func main() {
 	transport := nostr.NewTransport(cfg, pool, server)
 	var directServer *http.Server
 	if httpListen != "" {
-		requireRequestID := offer.HasFeature(nostr.FeatureRequestIDV1)
 		directServer = &http.Server{
 			Addr: httpListen,
 			Handler: httpapi.NewHandlerWithOptions(server, httpapi.Options{
-				RequireRequestID: requireRequestID,
-				MaxConcurrent:    32,
+				RequireRequestID:   offer.HasFeature(nostr.FeatureRequestIDV1),
+				MaxConcurrent:      httpMaxConcurrent,
+				MinRequestInterval: httpRequestInterval,
+				RequestBurst:       httpRequestBurst,
 			}),
 			ReadHeaderTimeout: 2 * time.Second,
-			ReadTimeout:       20 * time.Second,
+			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      20 * time.Second,
-			MaxHeaderBytes:    1 << 20,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    16 << 10,
 		}
 	}
 
@@ -252,6 +305,8 @@ func main() {
 	log.Printf("advertising %s features %v on relays %v", network, offer.Features, relays)
 	if directServer != nil {
 		log.Printf("direct HTTP endpoint listening on %s; advertised URLs %v", directServer.Addr, offer.URLs)
+		log.Printf("direct HTTP limits: concurrent=%d interval=%s burst=%d",
+			httpMaxConcurrent, httpRequestInterval, httpRequestBurst)
 		if len(offer.URLs) == 0 {
 			log.Println("direct HTTP endpoint is not advertised because -urls is empty")
 		}

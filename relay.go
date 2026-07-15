@@ -12,11 +12,16 @@ import (
 )
 
 var ClientFacing = errors.New("")
+var noCircuitOpened = errors.New("")
+
+const defaultMaxActiveCircuits uint64 = 128
 
 type Relay struct {
 	RelayParameters
 	lnc.LN
 	sync.WaitGroup
+	activeMu       sync.Mutex
+	activeCircuits uint64
 }
 
 type RelayParameters struct {
@@ -27,6 +32,7 @@ type RelayParameters struct {
 	RoutingFeePPM      uint64
 	ExpiryBuffer       uint64
 	MaxExpiry          uint64
+	MaxActiveCircuits  uint64
 	CltvDeltaAlpha     uint64
 	CltvDeltaBeta      uint64
 	RoutingBudgetAlpha uint64
@@ -47,6 +53,7 @@ func NewRelay(ln lnc.LN) *Relay {
 			MaxAmountMsat:      1_000_000_000,
 			ExpiryBuffer:       300,
 			MaxExpiry:          604800, // 60*60*24*7 one week
+			MaxActiveCircuits:  defaultMaxActiveCircuits,
 			MinFeeBudgetMsat:   1000,
 			RoutingBudgetAlpha: 1000,
 			RoutingBudgetBeta:  1_500_000,
@@ -184,13 +191,18 @@ func (relay *Relay) wrap(x ProxyParameters) (proxy_invoice_params *lnc.InvoicePa
 func (relay *Relay) OpenCircuit(x ProxyParameters) (string, error) {
 	proxy_invoice_params, fee_budget_msat, err := relay.wrap(x)
 	if err != nil {
-		return "", err
+		return "", errors.Join(noCircuitOpened, err)
+	}
+	if !relay.acquireCircuit() {
+		return "", errors.Join(noCircuitOpened, ClientFacing, errors.New("relay is at active circuit capacity"))
 	}
 
 	proxy_invoice, err := relay.LN.AddInvoice(*proxy_invoice_params)
 	if errors.Is(err, lnc.PaymentHashExists) {
-		return "", errors.Join(ClientFacing, lnc.PaymentHashExists)
+		relay.releaseCircuit()
+		return "", errors.Join(noCircuitOpened, ClientFacing, lnc.PaymentHashExists)
 	} else if err != nil {
+		relay.releaseCircuit()
 		return "", err
 	}
 
@@ -202,6 +214,7 @@ func (relay *Relay) OpenCircuit(x ProxyParameters) (string, error) {
 
 func (relay *Relay) circuitSwitch(hash []byte, invoice string, fee_budget_msat uint64) {
 	defer relay.WaitGroup.Done()
+	defer relay.releaseCircuit()
 	log.Println("opened circuit for:", invoice, hex.EncodeToString(hash))
 	invoice_state, err := relay.LN.WatchInvoice(hash)
 	if err != nil || invoice_state.State != lnc.Accepted {
@@ -255,4 +268,35 @@ func (relay *Relay) circuitSwitch(hash []byte, invoice string, fee_budget_msat u
 	}
 	log.Println("circuit settled")
 	return
+}
+
+func (relay *Relay) acquireCircuit() bool {
+	relay.activeMu.Lock()
+	defer relay.activeMu.Unlock()
+	limit := relay.MaxActiveCircuits
+	if limit == 0 {
+		// Preserve compatibility for callers that construct RelayParameters
+		// directly and therefore leave newly added fields at their zero value.
+		limit = defaultMaxActiveCircuits
+	}
+	if relay.activeCircuits >= limit {
+		return false
+	}
+	relay.activeCircuits++
+	return true
+}
+
+func (relay *Relay) releaseCircuit() {
+	relay.activeMu.Lock()
+	defer relay.activeMu.Unlock()
+	if relay.activeCircuits > 0 {
+		relay.activeCircuits--
+	}
+}
+
+// CircuitMayBeOpen reports whether an OpenCircuit error may have occurred after
+// the hold-invoice creation request reached LND. Such errors need durable
+// idempotency retention because retrying them can encounter an existing invoice.
+func CircuitMayBeOpen(err error) bool {
+	return err != nil && !errors.Is(err, noCircuitOpened)
 }

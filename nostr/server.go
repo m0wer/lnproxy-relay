@@ -27,7 +27,10 @@ type Server struct {
 	now      func() time.Time
 }
 
-const maxCachedRequests = 4096
+const (
+	maxCachedRequests = 4096
+	errorCacheTTL     = time.Minute
+)
 
 var requestIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -57,7 +60,8 @@ func NewServer(r *relay.Relay, offer Offer) *Server {
 // proxy invoice or an error response.
 func (s *Server) Wrap(req Request) Response {
 	if req.RequestID == "" {
-		return s.wrap(req)
+		response, _ := s.wrap(req)
+		return response
 	}
 	if !requestIDPattern.MatchString(req.RequestID) {
 		return Response{RequestID: req.RequestID, Status: "ERROR", Reason: "invalid request_id"}
@@ -92,35 +96,39 @@ func (s *Server) Wrap(req Request) Response {
 	s.requests[req.RequestID] = result
 	s.mu.Unlock()
 
-	response := s.wrap(req)
+	response, durable := s.wrap(req)
 	response.RequestID = req.RequestID
 
 	s.mu.Lock()
 	result.response = response
-	result.expiresAt = s.now().Add(s.cacheTTL)
+	ttl := s.cacheTTL
+	if !durable && errorCacheTTL < ttl {
+		ttl = errorCacheTTL
+	}
+	result.expiresAt = s.now().Add(ttl)
 	close(result.ready)
 	s.mu.Unlock()
 	return response
 }
 
-func (s *Server) wrap(req Request) Response {
+func (s *Server) wrap(req Request) (Response, bool) {
 	if req.Method != "" && req.Method != MethodWrap {
-		return errorResponse("unsupported method")
+		return errorResponse("unsupported method"), false
 	}
 	feature := WrapFeature(req.Wrap)
 	if !s.Offer.HasFeature(feature) {
-		return errorResponse("unsupported wrap format: " + req.Wrap)
+		return errorResponse("unsupported wrap format: " + req.Wrap), false
 	}
 
 	proxyInvoice, err := s.Relay.OpenCircuit(req.ProxyParameters())
 	if err == nil {
-		return Response{ProxyInvoice: proxyInvoice}
+		return Response{ProxyInvoice: proxyInvoice}, true
 	}
 	if isClientFacing(err) {
-		return errorResponse(strings.TrimSpace(err.Error()))
+		return errorResponse(strings.TrimSpace(err.Error())), relay.CircuitMayBeOpen(err)
 	}
 	log.Println("lnproxy: internal error for request:", err)
-	return errorResponse("internal error")
+	return errorResponse("internal error"), relay.CircuitMayBeOpen(err)
 }
 
 func requestFingerprint(req Request) (string, error) {

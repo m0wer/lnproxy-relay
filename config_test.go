@@ -20,10 +20,11 @@ func TestValidate(t *testing.T) {
 		p       RelayParameters
 		wantErr bool
 	}{
-		{"ok", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000}, false},
-		{"zero min", RelayParameters{MinAmountMsat: 0, MaxAmountMsat: 2000}, true},
-		{"max below min", RelayParameters{MinAmountMsat: 2000, MaxAmountMsat: 1000}, true},
-		{"equal bounds", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 1000}, false},
+		{"ok", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000, MaxActiveCircuits: 1}, false},
+		{"zero min", RelayParameters{MinAmountMsat: 0, MaxAmountMsat: 2000, MaxActiveCircuits: 1}, true},
+		{"max below min", RelayParameters{MinAmountMsat: 2000, MaxAmountMsat: 1000, MaxActiveCircuits: 1}, true},
+		{"equal bounds", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 1000, MaxActiveCircuits: 1}, false},
+		{"omitted active circuit limit", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,6 +43,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 	t.Setenv("LNPROXY_BASE_FEE_MSAT", "2000")
 	t.Setenv("LNPROXY_FEE_PPM", "500")
 	t.Setenv("LNPROXY_MAX_EXPIRY", "86400")
+	t.Setenv("LNPROXY_MAX_ACTIVE_CIRCUITS", "64")
 
 	if err := p.ApplyEnvOverrides(); err != nil {
 		t.Fatalf("ApplyEnvOverrides: %v", err)
@@ -60,6 +62,9 @@ func TestApplyEnvOverrides(t *testing.T) {
 	}
 	if p.MaxExpiry != 86400 {
 		t.Errorf("MaxExpiry = %d, want 86400", p.MaxExpiry)
+	}
+	if p.MaxActiveCircuits != 64 {
+		t.Errorf("MaxActiveCircuits = %d, want 64", p.MaxActiveCircuits)
 	}
 }
 

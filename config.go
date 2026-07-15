@@ -33,6 +33,7 @@ func envOrUint64(key string, fallback uint64) (uint64, error) {
 //	LNPROXY_BASE_FEE_MSAT  -> RoutingFeeBaseMsat
 //	LNPROXY_FEE_PPM        -> RoutingFeePPM
 //	LNPROXY_MAX_EXPIRY     -> MaxExpiry (seconds)
+//	LNPROXY_MAX_ACTIVE_CIRCUITS -> MaxActiveCircuits
 func (p *RelayParameters) ApplyEnvOverrides() error {
 	var err error
 	if p.MinAmountMsat, err = envOrUint64("LNPROXY_MIN_MSAT", p.MinAmountMsat); err != nil {
@@ -48,6 +49,9 @@ func (p *RelayParameters) ApplyEnvOverrides() error {
 		return err
 	}
 	if p.MaxExpiry, err = envOrUint64("LNPROXY_MAX_EXPIRY", p.MaxExpiry); err != nil {
+		return err
+	}
+	if p.MaxActiveCircuits, err = envOrUint64("LNPROXY_MAX_ACTIVE_CIRCUITS", p.MaxActiveCircuits); err != nil {
 		return err
 	}
 	return nil

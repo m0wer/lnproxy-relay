@@ -34,6 +34,7 @@ func main() {
 	baseFeeMsatFlag := flag.Uint64("base-fee-msat", 0, "relay base fee in msat (0 = keep default/env)")
 	feePpmFlag := flag.Uint64("fee-ppm", 0, "relay proportional fee in ppm (0 = keep default/env)")
 	maxExpiryFlag := flag.Uint64("max-expiry", 0, "maximum proxy invoice expiry in seconds (0 = keep default/env)")
+	maxActiveCircuitsFlag := flag.Uint64("max-active-circuits", 0, "maximum active hold-invoice circuits (0 = keep default/env)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `usage: %s [flags] lnproxy.macaroon
@@ -141,6 +142,9 @@ func main() {
 	}
 	if *maxExpiryFlag != 0 {
 		lnproxyRelay.MaxExpiry = *maxExpiryFlag
+	}
+	if *maxActiveCircuitsFlag != 0 {
+		lnproxyRelay.MaxActiveCircuits = *maxActiveCircuitsFlag
 	}
 	if err := lnproxyRelay.RelayParameters.Validate(); err != nil {
 		log.Fatalln("invalid relay configuration:", err)

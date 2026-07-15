@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,5 +137,112 @@ func TestCircuitSwitchPaysWithSafeMargin(t *testing.T) {
 	}
 	if !m.settled {
 		t.Fatal("relay did not settle after learning the preimage")
+	}
+}
+
+type capacityLN struct {
+	*fakeLN
+	mu      sync.Mutex
+	adds    int
+	addErr  error
+	started chan struct{}
+	release chan struct{}
+}
+
+func (l *capacityLN) AddInvoice(lnc.InvoiceParameters) (string, error) {
+	l.mu.Lock()
+	l.adds++
+	err := l.addErr
+	l.mu.Unlock()
+	return "lnbc-proxy", err
+}
+
+func (l *capacityLN) WatchInvoice([]byte) (*lnc.InvoiceState, error) {
+	close(l.started)
+	<-l.release
+	return &lnc.InvoiceState{State: lnc.Canceled}, nil
+}
+
+func (l *capacityLN) addCalls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.adds
+}
+
+func TestOpenCircuitEnforcesActiveCircuitCapacity(t *testing.T) {
+	ln := &capacityLN{
+		fakeLN:  &fakeLN{decoded: decodedWithFeatures("8")},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	r := NewRelay(ln)
+	r.MaxActiveCircuits = 1
+	if _, err := r.OpenCircuit(ProxyParameters{Invoice: "lnbcrt1..."}); err != nil {
+		t.Fatalf("first OpenCircuit: %v", err)
+	}
+	<-ln.started
+
+	if _, err := r.OpenCircuit(ProxyParameters{Invoice: "lnbcrt1..."}); !errors.Is(err, ClientFacing) {
+		t.Fatalf("second OpenCircuit error = %v, want client-facing capacity error", err)
+	} else if CircuitMayBeOpen(err) {
+		t.Fatalf("capacity error unexpectedly marked as possibly open: %v", err)
+	}
+	if got := ln.addCalls(); got != 1 {
+		t.Fatalf("AddInvoice calls = %d, want 1", got)
+	}
+
+	close(ln.release)
+	r.WaitGroup.Wait()
+}
+
+func TestOpenCircuitUsesDefaultCapacityWhenLimitIsOmitted(t *testing.T) {
+	r := &Relay{}
+	for i := uint64(0); i < defaultMaxActiveCircuits; i++ {
+		if !r.acquireCircuit() {
+			t.Fatalf("acquireCircuit rejected circuit %d before default capacity", i+1)
+		}
+	}
+	if r.acquireCircuit() {
+		t.Fatal("acquireCircuit exceeded default capacity")
+	}
+}
+
+func TestOpenCircuitReleasesCapacityAfterAddInvoiceError(t *testing.T) {
+	addErr := errors.New("add invoice response lost")
+	ln := &capacityLN{
+		fakeLN: &fakeLN{decoded: decodedWithFeatures("8")},
+		addErr: addErr,
+	}
+	r := NewRelay(ln)
+	r.MaxActiveCircuits = 1
+
+	_, err := r.OpenCircuit(ProxyParameters{Invoice: "lnbcrt1..."})
+	if !errors.Is(err, addErr) {
+		t.Fatalf("OpenCircuit error = %v, want %v", err, addErr)
+	}
+	if !CircuitMayBeOpen(err) {
+		t.Fatalf("uncertain AddInvoice error marked side-effect-free: %v", err)
+	}
+
+	ln.mu.Lock()
+	ln.addErr = lnc.PaymentHashExists
+	ln.mu.Unlock()
+	_, err = r.OpenCircuit(ProxyParameters{Invoice: "lnbcrt1..."})
+	if !errors.Is(err, lnc.PaymentHashExists) {
+		t.Fatalf("second OpenCircuit error = %v, want PaymentHashExists", err)
+	}
+	if CircuitMayBeOpen(err) {
+		t.Fatalf("definite PaymentHashExists error marked as possibly opened: %v", err)
+	}
+}
+
+func TestCircuitMayBeOpenRejectsPreInvoiceErrors(t *testing.T) {
+	r := NewRelay(&fakeLN{decoded: decodedWithFeatures("999")})
+	_, err := r.OpenCircuit(ProxyParameters{Invoice: "lnbcrt1..."})
+	if err == nil {
+		t.Fatal("OpenCircuit unexpectedly accepted unsupported invoice")
+	}
+	if CircuitMayBeOpen(err) {
+		t.Fatalf("validation error marked as possibly opened: %v", err)
 	}
 }

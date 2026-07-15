@@ -1,6 +1,7 @@
 package nostr
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 type idempotencyLN struct {
 	mu         sync.Mutex
 	addCalls   int
+	addErr     error
 	addStarted chan struct{}
 	addRelease chan struct{}
 }
@@ -31,7 +33,7 @@ func (l *idempotencyLN) AddInvoice(lnc.InvoiceParameters) (string, error) {
 		close(l.addStarted)
 		<-l.addRelease
 	}
-	return "lnbc-proxy-invoice", nil
+	return "lnbc-proxy-invoice", l.addErr
 }
 
 func (l *idempotencyLN) WatchInvoice([]byte) (*lnc.InvoiceState, error) {
@@ -144,6 +146,53 @@ func TestServerDoesNotEvictUnexpiredRequestIDs(t *testing.T) {
 	}
 	if _, ok := server.requests[fmt.Sprintf("%064x", 0)]; !ok {
 		t.Fatal("unexpired cache entry was evicted")
+	}
+}
+
+func TestServerExpiresSideEffectFreeErrorsQuickly(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	server := NewServer(relayForServerTest(&idempotencyLN{}), Offer{Features: []string{FeatureWrapBolt11}})
+	server.now = func() time.Time { return now }
+	req := Request{
+		Method:    MethodWrap,
+		RequestID: strings.Repeat("a", 64),
+		Invoice:   "lnbc1...",
+		Wrap:      "bolt12",
+	}
+	server.Wrap(req)
+	first := server.requests[req.RequestID]
+	if got := first.expiresAt.Sub(now); got != errorCacheTTL {
+		t.Fatalf("error cache TTL = %s, want %s", got, errorCacheTTL)
+	}
+
+	now = now.Add(errorCacheTTL + time.Second)
+	server.Wrap(req)
+	if server.requests[req.RequestID] == first {
+		t.Fatal("expired error cache entry was reused")
+	}
+}
+
+func TestServerRetainsUncertainAddInvoiceErrors(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	ln := &idempotencyLN{addErr: errors.New("add invoice response lost")}
+	server := NewServer(relayForServerTest(ln), Offer{
+		Features:         []string{FeatureWrapBolt11},
+		MaxExpirySeconds: 3600,
+	})
+	server.now = func() time.Time { return now }
+	req := Request{
+		Method:    MethodWrap,
+		RequestID: strings.Repeat("a", 64),
+		Invoice:   "lnbc1...",
+		Wrap:      "bolt11",
+	}
+
+	response := server.Wrap(req)
+	if response.Status != "ERROR" || response.Reason != "internal error" {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+	if got := server.requests[req.RequestID].expiresAt.Sub(now); got != server.cacheTTL {
+		t.Fatalf("uncertain error cache TTL = %s, want %s", got, server.cacheTTL)
 	}
 }
 

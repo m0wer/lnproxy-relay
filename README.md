@@ -79,6 +79,7 @@ built-in default):
 | `-base-fee-msat` | `LNPROXY_BASE_FEE_MSAT` | relay base fee (msat) |
 | `-fee-ppm` | `LNPROXY_FEE_PPM` | relay proportional fee (ppm) |
 | `-max-expiry` | `LNPROXY_MAX_EXPIRY` | maximum proxy invoice expiry (seconds) |
+| `-max-active-circuits` | `LNPROXY_MAX_ACTIVE_CIRCUITS` | maximum concurrent hold-invoice circuits (default 128) |
 
 For example, to cap proxied amounts at 500,000 sats and charge 0.2%:
 
@@ -129,8 +130,11 @@ Useful flags (all fee/limit flags above also apply):
 | `-announce-pow` | NIP-13 difficulty mined into each offer |
 | `-disable-ln-signing` | do not attest the nostr identity with your node key |
 | `-identity-pow` | anonymous identity proof of work bits (used with `-disable-ln-signing`) |
-| `-urls` | direct HTTP/onion `/spec` endpoints to advertise, in preference order |
+| `-urls` (env `LNPROXY_URLS`) | direct HTTP/onion `/spec` endpoints to advertise, in preference order |
 | `-http-listen` (env `LNPROXY_HTTP_LISTEN`) | optional direct HTTP listen address, for example `127.0.0.1:4747` |
+| `-http-max-concurrent` (env `LNPROXY_HTTP_MAX_CONCURRENT`) | concurrent direct handlers (default 8) |
+| `-http-request-interval` (env `LNPROXY_HTTP_REQUEST_INTERVAL`) | global direct request interval (default 5s) |
+| `-http-request-burst` (env `LNPROXY_HTTP_REQUEST_BURST`) | direct request burst capacity (default 3) |
 
 By default the relay attests its nostr identity with its lightning node key, so
 clients can verify that the advertisement belongs to a real node. A standard
@@ -152,9 +156,12 @@ When both `-http-listen` and `-urls` are set, the offer automatically advertises
 `request_id_v1`. Direct and nostr retries then share one idempotency cache, so a
 lost HTTP response cannot open a second hold invoice. Put clearnet listeners
 behind an HTTPS reverse proxy. The direct HTTP endpoint does not have the Nostr
-request proof-of-work gate, so public deployments should also enforce connection
-and request rate limits at that proxy. Onion services can forward to the
-loopback listener directly.
+request proof-of-work gate, so the integrated listener defaults to eight active
+handlers and a global burst of three requests followed by one request every five
+seconds. Public deployments should additionally enforce per-client connection
+and request limits at their reverse proxy. Onion services can forward to the
+loopback listener directly. Both transports also share the default limit of 128
+active hold-invoice circuits.
 
 Note on privacy: as a relay operator you see the complete invoices you are asked
 to pay, including their destination, amount and description/memo. A direct
