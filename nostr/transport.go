@@ -72,14 +72,20 @@ type Pool interface {
 // Transport publishes provider offers and serves encrypted wrap requests over
 // nostr. It is created with NewTransport and driven with Run.
 type Transport struct {
-	cfg     Config
-	pool    Pool
-	handler WrapHandler
+	cfg               Config
+	pool              Pool
+	handler           WrapHandler
+	responsePoWTarget int
 }
 
 // NewTransport constructs a Transport. pool is usually a *gonostr.SimplePool.
 func NewTransport(cfg Config, pool Pool, handler WrapHandler) *Transport {
-	return &Transport{cfg: cfg.withDefaults(), pool: pool, handler: handler}
+	return &Transport{
+		cfg:               cfg.withDefaults(),
+		pool:              pool,
+		handler:           handler,
+		responsePoWTarget: 20,
+	}
 }
 
 // buildOfferEvent constructs and signs a kind 38421 offer event for the current
@@ -257,8 +263,10 @@ func (t *Transport) reply(ctx context.Context, reqEvt *gonostr.Event, convKey [3
 		Content: string(ciphertext),
 	}
 	// A light proof of work keeps responses acceptable to relays enforcing a floor.
-	if nonceTag, err := nip13.DoWork(ctx, evt, 20); err == nil {
-		evt.Tags = append(evt.Tags, nonceTag)
+	if t.responsePoWTarget > 0 {
+		if nonceTag, err := nip13.DoWork(ctx, evt, t.responsePoWTarget); err == nil {
+			evt.Tags = append(evt.Tags, nonceTag)
+		}
 	}
 	if err := evt.Sign(t.cfg.SecretKey); err != nil {
 		log.Println("nostr: sign response error", err)

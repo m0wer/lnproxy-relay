@@ -19,7 +19,8 @@ services:
       - ./nostr/testdata/relay-config.toml:/usr/src/app/config.toml:ro
     healthcheck:
       # The relay answers the NIP-11 document over HTTP on the same port.
-      test: ["CMD-SHELL", "wget -q -O- --header='Accept: application/nostr+json' http://127.0.0.1:8080/ | grep -q supported_nips"]
+      # The image has bash but no curl/wget, so issue the request over /dev/tcp.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET / HTTP/1.0\\r\\nAccept: application/nostr+json\\r\\n\\r\\n\" >&3; grep -q supported_nips <&3'"]
       interval: 3s
       timeout: 5s
       retries: 20

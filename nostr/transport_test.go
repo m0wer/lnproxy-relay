@@ -102,7 +102,11 @@ func newTestTransport(t *testing.T, handler WrapHandler) (*Transport, *fakePool,
 		AnnouncePoWTarget: 0,
 		RequestRateLimit:  time.Millisecond,
 	}
-	return NewTransport(cfg, pool, handler), pool, id
+	transport := NewTransport(cfg, pool, handler)
+	// Response PoW is production transport policy, not behavior under test here.
+	// Disabling it keeps race-detector runs deterministic on constrained CI hosts.
+	transport.responsePoWTarget = 0
+	return transport, pool, id
 }
 
 // buildClientRequest builds a signed, encrypted kind 21821 request event from a
