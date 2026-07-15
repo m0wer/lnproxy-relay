@@ -1,0 +1,270 @@
+package nostr
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log"
+	"strconv"
+	"time"
+
+	gonostr "github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip13"
+	"github.com/nbd-wtf/go-nostr/nip44"
+)
+
+// WrapHandler turns a decrypted request into a response. It is satisfied by
+// *Server (which calls relay.Relay.OpenCircuit) and is an interface so tests
+// can substitute a fake.
+type WrapHandler interface {
+	Wrap(req Request) Response
+}
+
+// Config configures a provider Transport.
+type Config struct {
+	// SecretKey is the provider's persistent nostr private key (hex).
+	SecretKey string
+	// PublicKey is the corresponding x-only public key (hex).
+	PublicKey string
+	// Relays is the set of nostr relay URLs to publish offers to and listen on.
+	Relays []string
+	// Network is the bitcoin network this provider serves.
+	Network Network
+	// Offer is the advertisement content (fees, limits, features, optional
+	// attestation and identity proof of work). Relays is overwritten with
+	// Config.Relays at publish time.
+	Offer Offer
+	// AnnouncePoWTarget is the NIP-13 difficulty mined into each offer event.
+	AnnouncePoWTarget int
+	// OfferInterval is how often offers are re-published.
+	OfferInterval time.Duration
+	// MaxQueuedRequests bounds the in-flight request queue; excess requests are
+	// dropped (denial-of-service protection).
+	MaxQueuedRequests int
+	// RequestRateLimit is the minimum delay between dequeuing requests.
+	RequestRateLimit time.Duration
+}
+
+// withDefaults returns a copy of c with sane defaults filled in.
+func (c Config) withDefaults() Config {
+	if c.AnnouncePoWTarget == 0 {
+		c.AnnouncePoWTarget = 20
+	}
+	if c.OfferInterval == 0 {
+		c.OfferInterval = 10 * time.Minute
+	}
+	if c.MaxQueuedRequests == 0 {
+		c.MaxQueuedRequests = 5
+	}
+	if c.RequestRateLimit == 0 {
+		c.RequestRateLimit = 5 * time.Second
+	}
+	return c
+}
+
+// Pool is the subset of *gonostr.SimplePool used by Transport, extracted as an
+// interface for testing.
+type Pool interface {
+	SubscribeMany(ctx context.Context, urls []string, filter gonostr.Filter, opts ...gonostr.SubscriptionOption) chan gonostr.RelayEvent
+	PublishMany(ctx context.Context, urls []string, evt gonostr.Event) chan gonostr.PublishResult
+}
+
+// Transport publishes provider offers and serves encrypted wrap requests over
+// nostr. It is created with NewTransport and driven with Run.
+type Transport struct {
+	cfg     Config
+	pool    Pool
+	handler WrapHandler
+}
+
+// NewTransport constructs a Transport. pool is usually a *gonostr.SimplePool.
+func NewTransport(cfg Config, pool Pool, handler WrapHandler) *Transport {
+	return &Transport{cfg: cfg.withDefaults(), pool: pool, handler: handler}
+}
+
+// buildOfferEvent constructs and signs a kind 38421 offer event for the current
+// configuration, mining the announcement proof of work.
+func (t *Transport) buildOfferEvent(ctx context.Context) (*gonostr.Event, error) {
+	offer := t.cfg.Offer
+	offer.Relays = t.cfg.Relays
+	content, err := json.Marshal(offer)
+	if err != nil {
+		return nil, err
+	}
+	expiration := time.Now().Add(t.cfg.OfferInterval + time.Minute).Unix()
+	evt := gonostr.Event{
+		PubKey:    t.cfg.PublicKey,
+		CreatedAt: gonostr.Now(),
+		Kind:      KindOffer,
+		Tags: gonostr.Tags{
+			{"d", ProtocolVersion},
+			{"n", string(t.cfg.Network)},
+			{"expiration", strconv.FormatInt(expiration, 10)},
+		},
+		Content: string(content),
+	}
+	if t.cfg.AnnouncePoWTarget > 0 {
+		nonceTag, err := nip13.DoWork(ctx, evt, t.cfg.AnnouncePoWTarget)
+		if err != nil {
+			return nil, err
+		}
+		evt.Tags = append(evt.Tags, nonceTag)
+	}
+	if err := evt.Sign(t.cfg.SecretKey); err != nil {
+		return nil, err
+	}
+	return &evt, nil
+}
+
+// publishOffer mines and broadcasts one offer event.
+func (t *Transport) publishOffer(ctx context.Context) error {
+	evt, err := t.buildOfferEvent(ctx)
+	if err != nil {
+		return err
+	}
+	results := t.pool.PublishMany(ctx, t.cfg.Relays, *evt)
+	for range results {
+		// drain; individual relay failures are non-fatal
+	}
+	log.Printf("nostr: published offer %s to %d relays", evt.ID, len(t.cfg.Relays))
+	return nil
+}
+
+// Run publishes offers periodically and serves incoming requests until ctx is
+// cancelled. It blocks.
+func (t *Transport) Run(ctx context.Context) error {
+	if err := t.publishOffer(ctx); err != nil {
+		log.Println("nostr: initial offer publish error:", err)
+	}
+
+	queue := make(chan gonostr.RelayEvent, t.cfg.MaxQueuedRequests)
+	go t.serveQueue(ctx, queue)
+
+	sub := t.pool.SubscribeMany(ctx, t.cfg.Relays, gonostr.Filter{
+		Kinds: []int{KindRequest},
+		Tags:  gonostr.TagMap{"p": []string{t.cfg.PublicKey}},
+	})
+
+	ticker := time.NewTicker(t.cfg.OfferInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := t.publishOffer(ctx); err != nil {
+				log.Println("nostr: offer publish error:", err)
+			}
+		case ev, ok := <-sub:
+			if !ok {
+				return errors.New("nostr: subscription closed")
+			}
+			if ev.Event == nil {
+				continue
+			}
+			select {
+			case queue <- ev:
+			default:
+				log.Println("nostr: request queue full, dropping request", ev.Event.ID)
+			}
+		}
+	}
+}
+
+// serveQueue processes queued requests one at a time, rate limited.
+func (t *Transport) serveQueue(ctx context.Context, queue chan gonostr.RelayEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-queue:
+			t.handleRequest(ctx, ev.Event)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(t.cfg.RequestRateLimit):
+			}
+		}
+	}
+}
+
+// handleRequest validates, decrypts, processes and replies to a single request
+// event.
+//
+// A provider only needs to validate the requests reaching it: it checks the
+// client's signature and that the client met the advertised request proof of
+// work (MinRequestPoW), which is the denial-of-service protection. It does not
+// verify its own announcement proof of work, nor any other provider's offer or
+// proof of work; ranking providers by proof of work and attestation is purely a
+// client concern.
+func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
+	if ok, err := evt.CheckSignature(); err != nil || !ok {
+		log.Println("nostr: bad request signature", evt.ID)
+		return
+	}
+	// Enforce the request proof of work we advertise (DoS protection).
+	if err := nip13.Check(evt.ID, t.cfg.Offer.MinRequestPoW); err != nil {
+		log.Println("nostr: request below required proof of work", evt.ID)
+		return
+	}
+	if nip13.CommittedDifficulty(evt) < t.cfg.Offer.MinRequestPoW {
+		log.Println("nostr: request proof of work not committed to target", evt.ID)
+		return
+	}
+
+	convKey, err := nip44.GenerateConversationKey(evt.PubKey, t.cfg.SecretKey)
+	if err != nil {
+		log.Println("nostr: conversation key error", err)
+		return
+	}
+	plaintext, err := nip44.Decrypt(evt.Content, convKey)
+	if err != nil {
+		log.Println("nostr: decrypt error", err)
+		return
+	}
+	var req Request
+	if err := json.Unmarshal([]byte(plaintext), &req); err != nil {
+		t.reply(ctx, evt, convKey, errorResponse("bad request"))
+		return
+	}
+
+	resp := t.handler.Wrap(req)
+	t.reply(ctx, evt, convKey, resp)
+}
+
+// reply encrypts resp and publishes it as a kind 21822 response addressed to the
+// requester.
+func (t *Transport) reply(ctx context.Context, reqEvt *gonostr.Event, convKey [32]byte, resp Response) {
+	plaintext, err := MarshalResponse(resp)
+	if err != nil {
+		log.Println("nostr: marshal response error", err)
+		return
+	}
+	ciphertext, err := nip44.Encrypt(plaintext, convKey)
+	if err != nil {
+		log.Println("nostr: encrypt response error", err)
+		return
+	}
+	evt := gonostr.Event{
+		PubKey:    t.cfg.PublicKey,
+		CreatedAt: gonostr.Now(),
+		Kind:      KindResponse,
+		Tags: gonostr.Tags{
+			{"p", reqEvt.PubKey},
+			{"e", reqEvt.ID},
+		},
+		Content: string(ciphertext),
+	}
+	// A light proof of work keeps responses acceptable to relays enforcing a floor.
+	if nonceTag, err := nip13.DoWork(ctx, evt, 20); err == nil {
+		evt.Tags = append(evt.Tags, nonceTag)
+	}
+	if err := evt.Sign(t.cfg.SecretKey); err != nil {
+		log.Println("nostr: sign response error", err)
+		return
+	}
+	results := t.pool.PublishMany(ctx, t.cfg.Relays, evt)
+	for range results {
+	}
+}

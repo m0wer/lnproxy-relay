@@ -1,0 +1,247 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	gonostr "github.com/nbd-wtf/go-nostr"
+
+	"github.com/lnproxy/lnc"
+	relay "github.com/lnproxy/lnproxy-relay"
+	"github.com/lnproxy/lnproxy-relay/nostr"
+)
+
+// defaultNostrRelays is the working default relay set. It is overridable so
+// operators are never locked to these.
+const defaultNostrRelays = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net,wss://nostr.mom"
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// splitCSV splits a comma-separated list, trimming whitespace and dropping
+// empty entries.
+func splitCSV(s string) []string {
+	var out []string
+	for _, r := range strings.Split(s, ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func main() {
+	lndHostStringFlag := flag.String("lnd", "https://127.0.0.1:8080", "host for lnd's REST api")
+	lndCertPathFlag := flag.String("lnd-cert", ".lnd/tls.cert", "lnd's self-signed cert (empty string for no-rest-tls=true)")
+
+	keyPathFlag := flag.String("nostr-key", "lnproxy-nostr.key", "path to persistent nostr secret key (created if absent)")
+	relaysFlag := flag.String("nostr-relays", "", "comma-separated nostr relay URLs (default built-in set or LNPROXY_NOSTR_RELAYS)")
+	networkFlag := flag.String("network", "mainnet", "bitcoin network: mainnet|testnet|signet|regtest (or LNPROXY_NETWORK)")
+	featuresFlag := flag.String("features", "pay_bolt11,pay_bolt11_blinded,wrap_bolt11", "comma-separated advertised feature flags")
+	minRequestPoWFlag := flag.Int("min-request-pow", 20, "minimum NIP-13 difficulty required on wrap requests")
+	announcePoWFlag := flag.Int("announce-pow", 20, "NIP-13 difficulty mined into each offer event")
+	idPoWFlag := flag.Int("identity-pow", 0, "optional anonymous identity proof of work bits to mine (0 = none)")
+	disableLNSigningFlag := flag.Bool("disable-ln-signing", false, "do not attest the nostr identity with the LN node key")
+	offerIntervalFlag := flag.Duration("offer-interval", 10*time.Minute, "how often to re-publish the offer")
+	urlsFlag := flag.String("urls", "", "comma-separated legacy HTTP/onion endpoints to advertise (optional)")
+
+	minMsatFlag := flag.Uint64("min-msat", 0, "minimum invoice amount in msat (0 = default/env)")
+	maxMsatFlag := flag.Uint64("max-msat", 0, "maximum invoice amount in msat (0 = default/env)")
+	baseFeeMsatFlag := flag.Uint64("base-fee-msat", 0, "relay base fee in msat (0 = default/env)")
+	feePpmFlag := flag.Uint64("fee-ppm", 0, "relay proportional fee in ppm (0 = default/env)")
+	maxExpiryFlag := flag.Uint64("max-expiry", 0, "maximum proxy invoice expiry in seconds (0 = default/env)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), `usage: %s [flags] lnproxy.macaroon
+  lnproxy.macaroon
+	Path to lnproxy macaroon. Generate it with:
+		lncli bakemacaroon --save_to lnproxy.macaroon \
+			uri:/lnrpc.Lightning/DecodePayReq \
+			uri:/lnrpc.Lightning/LookupInvoice \
+			uri:/lnrpc.Lightning/SignMessage \
+			uri:/lnrpc.Lightning/GetInfo \
+			uri:/invoicesrpc.Invoices/AddHoldInvoice \
+			uri:/invoicesrpc.Invoices/SubscribeSingleInvoice \
+			uri:/invoicesrpc.Invoices/CancelInvoice \
+			uri:/invoicesrpc.Invoices/SettleInvoice \
+			uri:/routerrpc.Router/SendPaymentV2 \
+			uri:/routerrpc.Router/EstimateRouteFee \
+			uri:/chainrpc.ChainKit/GetBestBlock
+	Omit SignMessage/GetInfo if running with -disable-ln-signing.
+`, os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(2)
+	}
+	flag.Parse()
+
+	lndHostString := envOr("LNPROXY_LND_HOST", *lndHostStringFlag)
+	lndCertPath := envOr("LNPROXY_LND_CERT", *lndCertPathFlag)
+	relaysCSV := *relaysFlag
+	if relaysCSV == "" {
+		relaysCSV = envOr("LNPROXY_NOSTR_RELAYS", defaultNostrRelays)
+	}
+	relays := splitCSV(relaysCSV)
+	if len(relays) == 0 {
+		log.Fatalln("no nostr relays configured")
+	}
+
+	network, err := nostr.ParseNetwork(envOr("LNPROXY_NETWORK", *networkFlag))
+	if err != nil {
+		log.Fatalln("invalid network configuration:", err)
+	}
+
+	lnproxyMacaroon := os.Getenv("LNPROXY_MACAROON")
+	if lnproxyMacaroon == "" && len(flag.Args()) == 1 {
+		lnproxyMacaroon = flag.Args()[0]
+	} else if lnproxyMacaroon == "" {
+		flag.Usage()
+	}
+
+	macaroonBytes, err := os.ReadFile(lnproxyMacaroon)
+	if err != nil {
+		log.Fatalln("unable to read lnproxy macaroon file:", err)
+	}
+	macaroon := hex.EncodeToString(macaroonBytes)
+
+	lndHost, err := url.Parse(lndHostString)
+	if err != nil {
+		log.Fatalln("unable to parse lnd host url:", err)
+	}
+	lndHost.Path = "/"
+
+	var lndTlsConfig *tls.Config
+	if lndCertPath == "" {
+		lndTlsConfig = &tls.Config{}
+	} else {
+		lndCert, err := os.ReadFile(lndCertPath)
+		if err != nil {
+			log.Fatalln("unable to read lnd tls certificate file:", err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(lndCert)
+		lndTlsConfig = &tls.Config{RootCAs: caCertPool}
+	}
+
+	lndClient := &http.Client{Transport: &http.Transport{TLSClientConfig: lndTlsConfig}}
+	lnd := &lnc.Lnd{Host: lndHost, Client: lndClient, TlsConfig: lndTlsConfig, Macaroon: macaroon}
+
+	lnproxyRelay := relay.NewRelay(lnd)
+	if err := lnproxyRelay.RelayParameters.ApplyEnvOverrides(); err != nil {
+		log.Fatalln("invalid environment configuration:", err)
+	}
+	if *minMsatFlag != 0 {
+		lnproxyRelay.MinAmountMsat = *minMsatFlag
+	}
+	if *maxMsatFlag != 0 {
+		lnproxyRelay.MaxAmountMsat = *maxMsatFlag
+	}
+	if *baseFeeMsatFlag != 0 {
+		lnproxyRelay.RoutingFeeBaseMsat = *baseFeeMsatFlag
+	}
+	if *feePpmFlag != 0 {
+		lnproxyRelay.RoutingFeePPM = *feePpmFlag
+	}
+	if *maxExpiryFlag != 0 {
+		lnproxyRelay.MaxExpiry = *maxExpiryFlag
+	}
+	if err := lnproxyRelay.RelayParameters.Validate(); err != nil {
+		log.Fatalln("invalid relay configuration:", err)
+	}
+
+	identity, err := nostr.LoadOrCreateIdentity(*keyPathFlag)
+	if err != nil {
+		log.Fatalln("nostr identity error:", err)
+	}
+	log.Println("nostr public key:", identity.PublicKey)
+
+	offer := nostr.Offer{
+		BaseFeeMsat:      lnproxyRelay.RoutingFeeBaseMsat,
+		FeePPM:           lnproxyRelay.RoutingFeePPM,
+		MinAmountMsat:    lnproxyRelay.MinAmountMsat,
+		MaxAmountMsat:    lnproxyRelay.MaxAmountMsat,
+		MaxExpirySeconds: lnproxyRelay.MaxExpiry,
+		MinRequestPoW:    *minRequestPoWFlag,
+		Features:         splitCSV(*featuresFlag),
+		URLs:             splitCSV(*urlsFlag),
+	}
+
+	// Optional LN node attestation binds this nostr identity to the node.
+	if !*disableLNSigningFlag {
+		if err := attest(newLNDSigner(lnd), identity, &offer); err != nil {
+			log.Fatalln("node attestation failed (use -disable-ln-signing to skip):", err)
+		}
+		log.Println("attested nostr identity with node", offer.NodePubkey)
+	} else if *idPoWFlag > 0 {
+		nonce, bitsGot, err := nostr.MineAnnouncePoW(identity.PublicKey, *idPoWFlag, 1, 0)
+		if err != nil {
+			log.Fatalln("identity proof of work failed:", err)
+		}
+		offer.PoWNonce = fmt.Sprintf("0x%x", nonce)
+		log.Printf("mined anonymous identity proof of work: %d bits", bitsGot)
+	}
+
+	cfg := nostr.Config{
+		SecretKey:         identity.SecretKey,
+		PublicKey:         identity.PublicKey,
+		Relays:            relays,
+		Network:           network,
+		Offer:             offer,
+		AnnouncePoWTarget: *announcePoWFlag,
+		OfferInterval:     *offerIntervalFlag,
+	}
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	pool := gonostr.NewSimplePool(ctx)
+	server := nostr.NewServer(lnproxyRelay, offer)
+	transport := nostr.NewTransport(cfg, pool, server)
+
+	log.Printf("relay limits: min=%d msat max=%d msat fee=%d msat + %d ppm",
+		lnproxyRelay.MinAmountMsat, lnproxyRelay.MaxAmountMsat,
+		lnproxyRelay.RoutingFeeBaseMsat, lnproxyRelay.RoutingFeePPM)
+	log.Printf("advertising %s features %v on relays %v", network, offer.Features, relays)
+
+	go func() {
+		<-ctx.Done()
+		log.Println("shutting down, waiting for open circuits...")
+	}()
+
+	if err := transport.Run(ctx); err != nil && ctx.Err() == nil {
+		log.Println("nostr transport error:", err)
+	}
+	stopSignals()
+	lnproxyRelay.WaitGroup.Wait()
+	log.Println("shutdown complete")
+}
+
+// attest signs the attestation message with the node key and fills the offer.
+func attest(signer nodeSigner, identity nostr.Identity, offer *nostr.Offer) error {
+	pubkey, err := signer.IdentityPubkey()
+	if err != nil {
+		return err
+	}
+	sig, err := signer.SignMessage(nostr.AttestationMessage(identity.PublicKey))
+	if err != nil {
+		return err
+	}
+	offer.NodePubkey = pubkey
+	offer.NodeSig = sig
+	return nil
+}

@@ -111,7 +111,7 @@ func (relay *Relay) wrap(x ProxyParameters) (proxy_invoice_params *lnc.InvoicePa
 	}
 	for flag, _ := range p.Features {
 		switch flag {
-		case "8", "9", "14", "15", "16", "17", "25", "48", "49", "149", "151", "262":
+		case "8", "9", "14", "15", "16", "17", "25", "48", "49", "149", "151", "262", "263":
 			// 25 is route blinding
 			// 48/49 is payment metadata
 			// 148/149 is trampoline routing
@@ -214,11 +214,29 @@ func (relay *Relay) circuitSwitch(hash []byte, invoice string, fee_budget_msat u
 		}
 		return
 	}
+	// The outgoing payment to the original invoice must time out before the
+	// accepted proxy-invoice HTLC does, by at least CltvDeltaAlpha blocks, so
+	// that the relay always learns the preimage (and can settle the proxy
+	// invoice) before its incoming HTLC can be pulled back. The proxy invoice's
+	// min_final_cltv_expiry (>= MinCltvExpiry) guarantees this margin, but guard
+	// against a misconfiguration or an unexpectedly short accepted HTLC rather
+	// than letting the uint64 subtraction underflow into an unbounded CltvLimit,
+	// which would remove the safety margin and risk relay funds.
+	if invoice_state.CltvExpiryDelta <= relay.CltvDeltaAlpha {
+		log.Println("accepted HTLC cltv delta too short to pay out safely, canceling:",
+			hex.EncodeToString(hash), invoice_state.CltvExpiryDelta, relay.CltvDeltaAlpha)
+		err = relay.LN.CancelInvoice(hash)
+		if err != nil {
+			log.Println("error while canceling invoice:", hash, err)
+		}
+		return
+	}
+	cltv_limit := invoice_state.CltvExpiryDelta - relay.CltvDeltaAlpha
 	preimage, err := relay.LN.PayInvoice(lnc.PaymentParameters{
 		Invoice:        invoice,
 		TimeoutSeconds: relay.PaymentTimeout,
 		FeeLimitMsat:   fee_budget_msat,
-		CltvLimit:      invoice_state.CltvExpiryDelta - relay.CltvDeltaAlpha,
+		CltvLimit:      cltv_limit,
 	})
 	if errors.Is(err, lnc.PaymentFailed) {
 		log.Println("payment failed", hex.EncodeToString(hash), err)

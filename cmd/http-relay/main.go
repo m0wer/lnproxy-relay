@@ -81,6 +81,11 @@ func main() {
 		".lnd/tls.cert",
 		"lnd's self-signed cert (set to empty string for no-rest-tls=true)",
 	)
+	minMsatFlag := flag.Uint64("min-msat", 0, "minimum invoice amount in msat (0 = keep default/env)")
+	maxMsatFlag := flag.Uint64("max-msat", 0, "maximum invoice amount in msat (0 = keep default/env)")
+	baseFeeMsatFlag := flag.Uint64("base-fee-msat", 0, "relay base fee in msat (0 = keep default/env)")
+	feePpmFlag := flag.Uint64("fee-ppm", 0, "relay proportional fee in ppm (0 = keep default/env)")
+	maxExpiryFlag := flag.Uint64("max-expiry", 0, "maximum proxy invoice expiry in seconds (0 = keep default/env)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `usage: %s [flags] lnproxy.macaroon
@@ -168,6 +173,33 @@ func main() {
 	}
 
 	lnproxy_relay = relay.NewRelay(lnd)
+
+	// Operators set their own fees and limits. Precedence: flag (if non-zero)
+	// overrides env, env overrides the built-in default.
+	if err := lnproxy_relay.RelayParameters.ApplyEnvOverrides(); err != nil {
+		log.Fatalln("invalid environment configuration:", err)
+	}
+	if *minMsatFlag != 0 {
+		lnproxy_relay.MinAmountMsat = *minMsatFlag
+	}
+	if *maxMsatFlag != 0 {
+		lnproxy_relay.MaxAmountMsat = *maxMsatFlag
+	}
+	if *baseFeeMsatFlag != 0 {
+		lnproxy_relay.RoutingFeeBaseMsat = *baseFeeMsatFlag
+	}
+	if *feePpmFlag != 0 {
+		lnproxy_relay.RoutingFeePPM = *feePpmFlag
+	}
+	if *maxExpiryFlag != 0 {
+		lnproxy_relay.MaxExpiry = *maxExpiryFlag
+	}
+	if err := lnproxy_relay.RelayParameters.Validate(); err != nil {
+		log.Fatalln("invalid relay configuration:", err)
+	}
+	log.Printf("relay limits: min=%d msat max=%d msat fee=%d msat + %d ppm max_expiry=%d s",
+		lnproxy_relay.MinAmountMsat, lnproxy_relay.MaxAmountMsat,
+		lnproxy_relay.RoutingFeeBaseMsat, lnproxy_relay.RoutingFeePPM, lnproxy_relay.MaxExpiry)
 
 	http.HandleFunc("/spec", specApiHandler)
 

@@ -1,0 +1,310 @@
+package nostr
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"testing"
+	"time"
+
+	gonostr "github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip13"
+	"github.com/nbd-wtf/go-nostr/nip44"
+
+	"github.com/lnproxy/lnc"
+	relay "github.com/lnproxy/lnproxy-relay"
+)
+
+// mockLN is a minimal lnc.LN that lets a real relay.Relay run end-to-end in
+// tests without a node. The circuit goroutine started by OpenCircuit watches
+// the invoice; we return Canceled immediately so it exits cleanly.
+type mockLN struct {
+	decoded *lnc.DecodedInvoice
+	addErr  error
+}
+
+func (m *mockLN) DecodeInvoice(string) (*lnc.DecodedInvoice, error) {
+	return m.decoded, nil
+}
+func (m *mockLN) AddInvoice(lnc.InvoiceParameters) (string, error) {
+	if m.addErr != nil {
+		return "", m.addErr
+	}
+	return "lnbc-proxy-invoice", nil
+}
+func (m *mockLN) WatchInvoice([]byte) (*lnc.InvoiceState, error) {
+	return &lnc.InvoiceState{State: lnc.Canceled}, nil
+}
+func (m *mockLN) CancelInvoice([]byte) error { return nil }
+func (m *mockLN) PayInvoice(lnc.PaymentParameters) ([]byte, error) {
+	return nil, lnc.PaymentFailed
+}
+func (m *mockLN) SettleInvoice([]byte) error { return nil }
+func (m *mockLN) EstimateRoutingFee(lnc.DecodedInvoice, uint64) (uint64, uint64, error) {
+	return 1000, 144, nil
+}
+
+func validDecodedInvoice() *lnc.DecodedInvoice {
+	hash := make([]byte, 32)
+	for i := range hash {
+		hash[i] = byte(i)
+	}
+	return &lnc.DecodedInvoice{
+		PaymentHash: hex.EncodeToString(hash),
+		Timestamp:   uint64(time.Now().Unix()),
+		Expiry:      3600,
+		Description: "test",
+		NumMsat:     1_000_000,
+		CltvExpiry:  40,
+		Destination: "02deadbeef",
+	}
+}
+
+// fakePool implements Pool for tests: SubscribeMany returns a channel the test
+// feeds, PublishMany records published events.
+type fakePool struct {
+	incoming  chan gonostr.RelayEvent
+	published chan *gonostr.Event
+}
+
+func newFakePool() *fakePool {
+	return &fakePool{
+		incoming:  make(chan gonostr.RelayEvent, 4),
+		published: make(chan *gonostr.Event, 16),
+	}
+}
+
+func (p *fakePool) SubscribeMany(ctx context.Context, urls []string, filter gonostr.Filter, opts ...gonostr.SubscriptionOption) chan gonostr.RelayEvent {
+	return p.incoming
+}
+
+func (p *fakePool) PublishMany(ctx context.Context, urls []string, evt gonostr.Event) chan gonostr.PublishResult {
+	e := evt
+	p.published <- &e
+	ch := make(chan gonostr.PublishResult)
+	close(ch)
+	return ch
+}
+
+func newTestTransport(t *testing.T, handler WrapHandler) (*Transport, *fakePool, Identity) {
+	t.Helper()
+	id, err := LoadOrCreateIdentity(t.TempDir() + "/key")
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	pool := newFakePool()
+	cfg := Config{
+		SecretKey:         id.SecretKey,
+		PublicKey:         id.PublicKey,
+		Relays:            []string{"wss://example"},
+		Network:           Regtest,
+		Offer:             Offer{MinRequestPoW: 0, Features: []string{FeatureWrapBolt11}},
+		AnnouncePoWTarget: 0,
+		RequestRateLimit:  time.Millisecond,
+	}
+	return NewTransport(cfg, pool, handler), pool, id
+}
+
+// buildClientRequest builds a signed, encrypted kind 21821 request event from a
+// fresh client key to the provider.
+func buildClientRequest(t *testing.T, providerPub string, req Request, powTarget int) gonostr.RelayEvent {
+	t.Helper()
+	clientSK := gonostr.GeneratePrivateKey()
+	clientPK, err := gonostr.GetPublicKey(clientSK)
+	if err != nil {
+		t.Fatalf("client pubkey: %v", err)
+	}
+	convKey, err := nip44.GenerateConversationKey(providerPub, clientSK)
+	if err != nil {
+		t.Fatalf("conv key: %v", err)
+	}
+	plaintext, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	ciphertext, err := nip44.Encrypt(string(plaintext), convKey)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	evt := gonostr.Event{
+		PubKey:    clientPK,
+		CreatedAt: gonostr.Now(),
+		Kind:      KindRequest,
+		Tags:      gonostr.Tags{{"p", providerPub}},
+		Content:   ciphertext,
+	}
+	if powTarget > 0 {
+		nonceTag, err := nip13.DoWork(context.Background(), evt, powTarget)
+		if err != nil {
+			t.Fatalf("client pow: %v", err)
+		}
+		evt.Tags = append(evt.Tags, nonceTag)
+	}
+	if err := evt.Sign(clientSK); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return gonostr.RelayEvent{Event: &evt}
+}
+
+// decryptResponse decrypts a captured response event with the provider pubkey
+// using the client's view: it derives the conversation key from the provider
+// pubkey and the client secret. Here we cheat by re-deriving with the provider
+// secret, which yields the same shared key.
+func decryptResponse(t *testing.T, providerSK string, clientPub string, evt *gonostr.Event) Response {
+	t.Helper()
+	convKey, err := nip44.GenerateConversationKey(clientPub, providerSK)
+	if err != nil {
+		t.Fatalf("conv key: %v", err)
+	}
+	plaintext, err := nip44.Decrypt(evt.Content, convKey)
+	if err != nil {
+		t.Fatalf("decrypt response: %v", err)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(plaintext), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	return resp
+}
+
+func TestTransportWrapRoundTrip(t *testing.T) {
+	r := relay.NewRelay(&mockLN{decoded: validDecodedInvoice()})
+	offer := Offer{MinRequestPoW: 0, Features: []string{FeatureWrapBolt11}}
+	server := NewServer(r, offer)
+
+	transport, pool, id := newTestTransport(t, server)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+
+	// drain the offer publication
+	waitForPublished(t, pool, KindOffer)
+
+	req := Request{Method: MethodWrap, Invoice: "lnbc1...", Wrap: "bolt11"}
+	reqEvt := buildClientRequest(t, id.PublicKey, req, 0)
+	pool.incoming <- reqEvt
+
+	respEvt := waitForPublished(t, pool, KindResponse)
+	resp := decryptResponse(t, id.SecretKey, reqEvt.PubKey, respEvt)
+	if resp.ProxyInvoice != "lnbc-proxy-invoice" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	// response must reference the request
+	if respEvt.Tags.GetFirst([]string{"e"}) == nil {
+		t.Fatal("response missing e tag")
+	}
+
+	r.WaitGroup.Wait()
+}
+
+func TestTransportRejectsUnsupportedWrap(t *testing.T) {
+	r := relay.NewRelay(&mockLN{decoded: validDecodedInvoice()})
+	offer := Offer{MinRequestPoW: 0, Features: []string{FeatureWrapBolt11}}
+	server := NewServer(r, offer)
+	transport, pool, id := newTestTransport(t, server)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+
+	req := Request{Method: MethodWrap, Invoice: "lnbc1...", Wrap: "bolt12"}
+	reqEvt := buildClientRequest(t, id.PublicKey, req, 0)
+	pool.incoming <- reqEvt
+
+	respEvt := waitForPublished(t, pool, KindResponse)
+	resp := decryptResponse(t, id.SecretKey, reqEvt.PubKey, respEvt)
+	if resp.Status != "ERROR" {
+		t.Fatalf("expected ERROR, got %+v", resp)
+	}
+}
+
+func TestTransportDropsLowPoWRequest(t *testing.T) {
+	r := relay.NewRelay(&mockLN{decoded: validDecodedInvoice()})
+	offer := Offer{MinRequestPoW: 24, Features: []string{FeatureWrapBolt11}}
+	server := NewServer(r, offer)
+	transport, pool, id := newTestTransport(t, server)
+	transport.cfg.Offer.MinRequestPoW = 24
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+
+	// Request with no proof of work must be dropped (no response published).
+	req := Request{Method: MethodWrap, Invoice: "lnbc1...", Wrap: "bolt11"}
+	reqEvt := buildClientRequest(t, id.PublicKey, req, 0)
+	pool.incoming <- reqEvt
+
+	select {
+	case evt := <-pool.published:
+		if evt.Kind == KindResponse {
+			t.Fatal("expected low-pow request to be dropped, got a response")
+		}
+	case <-time.After(200 * time.Millisecond):
+		// good: nothing published
+	}
+}
+
+func waitForPublished(t *testing.T, pool *fakePool, kind int) *gonostr.Event {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case evt := <-pool.published:
+			if evt.Kind == kind {
+				return evt
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for published event kind %d", kind)
+			return nil
+		}
+	}
+}
+
+// sanity: Server maps client-facing relay errors through.
+func TestServerClientFacingError(t *testing.T) {
+	bad := validDecodedInvoice()
+	bad.NumMsat = 0 // triggers "zero amount invoices cannot be relayed trustlessly"
+	r := relay.NewRelay(&mockLN{decoded: bad})
+	server := NewServer(r, Offer{Features: []string{FeatureWrapBolt11}})
+
+	resp := server.Wrap(Request{Method: MethodWrap, Invoice: "x", Wrap: "bolt11"})
+	if resp.Status != "ERROR" {
+		t.Fatalf("expected ERROR, got %+v", resp)
+	}
+	if resp.Reason == "" {
+		t.Fatal("expected a client-facing reason, got empty")
+	}
+}
+
+// TestTransportServesRegardlessOfAnnouncePoW documents the threat model: the
+// provider gates incoming requests on the client's request proof of work, but
+// does not gate on its own announcement proof of work. A request meeting
+// MinRequestPoW is served even when AnnouncePoWTarget is high.
+func TestTransportServesRegardlessOfAnnouncePoW(t *testing.T) {
+	r := relay.NewRelay(&mockLN{decoded: validDecodedInvoice()})
+	offer := Offer{MinRequestPoW: 0, Features: []string{FeatureWrapBolt11}}
+	server := NewServer(r, offer)
+	transport, pool, id := newTestTransport(t, server)
+	// A non-trivial announcement target must not affect request handling.
+	transport.cfg.AnnouncePoWTarget = 16
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+
+	// Client request carries no proof of work; MinRequestPoW is 0, so it is served.
+	req := Request{Method: MethodWrap, Invoice: "lnbc1...", Wrap: "bolt11"}
+	reqEvt := buildClientRequest(t, id.PublicKey, req, 0)
+	pool.incoming <- reqEvt
+
+	respEvt := waitForPublished(t, pool, KindResponse)
+	resp := decryptResponse(t, id.SecretKey, reqEvt.PubKey, respEvt)
+	if resp.ProxyInvoice != "lnbc-proxy-invoice" {
+		t.Fatalf("expected wrap to succeed, got %+v", resp)
+	}
+	r.WaitGroup.Wait()
+}
