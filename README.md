@@ -61,8 +61,8 @@ to get the onion url and try:
 		--data '{"invoice":"<bolt11 invoice>"}' \
 		http://<your .onion url>/spec
 
-HTTP clients must configure this endpoint explicitly. The current lnproxy web
-UI discovers providers over nostr and does not bundle an HTTP relay directory.
+HTTP clients can configure this endpoint explicitly. Nostr providers can also
+advertise direct endpoints so clients discover them without an HTTP directory.
 
 ## Configuring your fees and limits
 
@@ -129,7 +129,8 @@ Useful flags (all fee/limit flags above also apply):
 | `-announce-pow` | NIP-13 difficulty mined into each offer |
 | `-disable-ln-signing` | do not attest the nostr identity with your node key |
 | `-identity-pow` | anonymous identity proof of work bits (used with `-disable-ln-signing`) |
-| `-urls` | optional HTTP/onion endpoints to also advertise |
+| `-urls` | direct HTTP/onion `/spec` endpoints to advertise, in preference order |
+| `-http-listen` (env `LNPROXY_HTTP_LISTEN`) | optional direct HTTP listen address, for example `127.0.0.1:4747` |
 
 By default the relay attests its nostr identity with its lightning node key, so
 clients can verify that the advertisement belongs to a real node. A standard
@@ -138,12 +139,29 @@ nothing new. If you only ever issue blinded or BOLT12 proxy invoices and want to
 keep your node id private, run with `-disable-ln-signing` and optionally
 `-identity-pow` instead.
 
-Note on privacy: as a relay operator you see the invoices you are asked to pay
-(their destination, amount, and description/memo unless the client strips it),
-but you do not learn who is paying or where the payment comes from. This is the
-same destination-side exposure analyzed by Kappos et al., *An Empirical Analysis
-of Privacy in the Lightning Network* (USENIX Security 2021); the payer remains
-hidden from you.
+To let discovered clients contact the provider directly before using nostr as a
+fallback, run both transports in the same process:
+
+	./nostr-relay \
+		-nostr-relays wss://nos.lol,wss://relay.damus.io \
+		-http-listen 127.0.0.1:4747 \
+		-urls https://lnproxy.example.com/spec,http://<your-v3-address>.onion/spec \
+		lnproxy.macaroon
+
+When both `-http-listen` and `-urls` are set, the offer automatically advertises
+`request_id_v1`. Direct and nostr retries then share one idempotency cache, so a
+lost HTTP response cannot open a second hold invoice. Put clearnet listeners
+behind an HTTPS reverse proxy. The direct HTTP endpoint does not have the Nostr
+request proof-of-work gate, so public deployments should also enforce connection
+and request rate limits at that proxy. Onion services can forward to the
+loopback listener directly.
+
+Note on privacy: as a relay operator you see the complete invoices you are asked
+to pay, including their destination, amount and description/memo. A direct
+clearnet client also exposes its IP unless it uses a proxy. Nostr transport hides
+that IP from the provider only when the Nostr relay does not disclose or share
+connection metadata. A direct onion endpoint over Tor avoids both third-party
+relay metadata and disclosure of the client IP to the provider.
 
 ## Operating your relay
 

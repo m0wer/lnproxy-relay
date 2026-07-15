@@ -20,6 +20,7 @@ import (
 
 	"github.com/lnproxy/lnc"
 	relay "github.com/lnproxy/lnproxy-relay"
+	"github.com/lnproxy/lnproxy-relay/httpapi"
 	"github.com/lnproxy/lnproxy-relay/nostr"
 )
 
@@ -46,6 +47,15 @@ func splitCSV(s string) []string {
 	return out
 }
 
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 func main() {
 	lndHostStringFlag := flag.String("lnd", "https://127.0.0.1:8080", "host for lnd's REST api")
 	lndCertPathFlag := flag.String("lnd-cert", ".lnd/tls.cert", "lnd's self-signed cert (empty string for no-rest-tls=true)")
@@ -59,7 +69,8 @@ func main() {
 	idPoWFlag := flag.Int("identity-pow", 0, "optional anonymous identity proof of work bits to mine (0 = none)")
 	disableLNSigningFlag := flag.Bool("disable-ln-signing", false, "do not attest the nostr identity with the LN node key")
 	offerIntervalFlag := flag.Duration("offer-interval", 10*time.Minute, "how often to re-publish the offer")
-	urlsFlag := flag.String("urls", "", "comma-separated legacy HTTP/onion endpoints to advertise (optional)")
+	urlsFlag := flag.String("urls", "", "comma-separated direct HTTP/onion wrap endpoints to advertise (optional)")
+	httpListenFlag := flag.String("http-listen", "", "optional direct HTTP listen address, for example 127.0.0.1:4747 (or LNPROXY_HTTP_LISTEN)")
 
 	minMsatFlag := flag.Uint64("min-msat", 0, "minimum invoice amount in msat (0 = default/env)")
 	maxMsatFlag := flag.Uint64("max-msat", 0, "maximum invoice amount in msat (0 = default/env)")
@@ -170,6 +181,13 @@ func main() {
 	}
 	log.Println("nostr public key:", identity.PublicKey)
 
+	httpListen := envOr("LNPROXY_HTTP_LISTEN", *httpListenFlag)
+	urls := splitCSV(*urlsFlag)
+	features := splitCSV(*featuresFlag)
+	if httpListen != "" && len(urls) > 0 {
+		features = appendUnique(features, nostr.FeatureRequestIDV1)
+	}
+
 	offer := nostr.Offer{
 		BaseFeeMsat:      lnproxyRelay.RoutingFeeBaseMsat,
 		FeePPM:           lnproxyRelay.RoutingFeePPM,
@@ -177,8 +195,8 @@ func main() {
 		MaxAmountMsat:    lnproxyRelay.MaxAmountMsat,
 		MaxExpirySeconds: lnproxyRelay.MaxExpiry,
 		MinRequestPoW:    *minRequestPoWFlag,
-		Features:         splitCSV(*featuresFlag),
-		URLs:             splitCSV(*urlsFlag),
+		Features:         features,
+		URLs:             urls,
 	}
 
 	// Optional LN node attestation binds this nostr identity to the node.
@@ -212,21 +230,68 @@ func main() {
 	pool := gonostr.NewSimplePool(ctx)
 	server := nostr.NewServer(lnproxyRelay, offer)
 	transport := nostr.NewTransport(cfg, pool, server)
+	var directServer *http.Server
+	if httpListen != "" {
+		requireRequestID := offer.HasFeature(nostr.FeatureRequestIDV1)
+		directServer = &http.Server{
+			Addr: httpListen,
+			Handler: httpapi.NewHandlerWithOptions(server, httpapi.Options{
+				RequireRequestID: requireRequestID,
+				MaxConcurrent:    32,
+			}),
+			ReadHeaderTimeout: 2 * time.Second,
+			ReadTimeout:       20 * time.Second,
+			WriteTimeout:      20 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
+	}
 
 	log.Printf("relay limits: min=%d msat max=%d msat fee=%d msat + %d ppm",
 		lnproxyRelay.MinAmountMsat, lnproxyRelay.MaxAmountMsat,
 		lnproxyRelay.RoutingFeeBaseMsat, lnproxyRelay.RoutingFeePPM)
 	log.Printf("advertising %s features %v on relays %v", network, offer.Features, relays)
+	if directServer != nil {
+		log.Printf("direct HTTP endpoint listening on %s; advertised URLs %v", directServer.Addr, offer.URLs)
+		if len(offer.URLs) == 0 {
+			log.Println("direct HTTP endpoint is not advertised because -urls is empty")
+		}
+	}
 
+	errCh := make(chan error, 2)
+	transportDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		log.Println("shutting down, waiting for open circuits...")
+		defer close(transportDone)
+		if err := transport.Run(ctx); err != nil && ctx.Err() == nil {
+			errCh <- fmt.Errorf("nostr transport: %w", err)
+		}
 	}()
 
-	if err := transport.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Println("nostr transport error:", err)
+	var directDone chan struct{}
+	if directServer != nil {
+		directDone = make(chan struct{})
+		go func() {
+			defer close(directDone)
+			if err := directServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("direct HTTP server: %w", err)
+			}
+		}()
+	}
+
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		log.Println(err)
 	}
 	stopSignals()
+	log.Println("shutting down transports...")
+	if directServer != nil {
+		if err := directServer.Shutdown(context.Background()); err != nil {
+			log.Println("direct HTTP shutdown error:", err)
+		}
+		<-directDone
+	}
+	<-transportDone
+	log.Println("waiting for open circuits...")
 	lnproxyRelay.WaitGroup.Wait()
 	log.Println("shutdown complete")
 }

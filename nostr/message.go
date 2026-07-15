@@ -10,6 +10,7 @@ import (
 // base protocol ProxyParameters and adds the method and desired output format.
 type Request struct {
 	Method          string  `json:"method"`
+	RequestID       string  `json:"request_id,omitempty"`
 	Invoice         string  `json:"invoice"`
 	RoutingMsat     *uint64 `json:"routing_msat,string,omitempty"`
 	Description     *string `json:"description,omitempty"`
@@ -50,6 +51,7 @@ func (r Request) ProxyParameters() relay.ProxyParameters {
 // Response is the decrypted plaintext of a kind 21822 wrap response. Exactly one
 // of ProxyInvoice or (Status, Reason) is set, matching the base HTTP API.
 type Response struct {
+	RequestID    string `json:"request_id,omitempty"`
 	ProxyInvoice string `json:"proxy_invoice,omitempty"`
 	Status       string `json:"status,omitempty"`
 	Reason       string `json:"reason,omitempty"`

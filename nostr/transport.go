@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	gonostr "github.com/nbd-wtf/go-nostr"
@@ -76,7 +77,16 @@ type Transport struct {
 	pool              Pool
 	handler           WrapHandler
 	responsePoWTarget int
+	seenMu            sync.Mutex
+	seenRequests      map[string]time.Time
+	now               func() time.Time
 }
+
+const (
+	requestFreshness  = 5 * time.Minute
+	requestFutureSkew = time.Minute
+	maxSeenRequests   = 4096
+)
 
 // NewTransport constructs a Transport. pool is usually a *gonostr.SimplePool.
 func NewTransport(cfg Config, pool Pool, handler WrapHandler) *Transport {
@@ -85,6 +95,8 @@ func NewTransport(cfg Config, pool Pool, handler WrapHandler) *Transport {
 		pool:              pool,
 		handler:           handler,
 		responsePoWTarget: 20,
+		seenRequests:      make(map[string]time.Time),
+		now:               time.Now,
 	}
 }
 
@@ -139,14 +151,25 @@ func (t *Transport) publishOffer(ctx context.Context) error {
 // Run publishes offers periodically and serves incoming requests until ctx is
 // cancelled. It blocks.
 func (t *Transport) Run(ctx context.Context) error {
-	if err := t.publishOffer(ctx); err != nil {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workerDone := make(chan struct{})
+	queue := make(chan gonostr.RelayEvent, t.cfg.MaxQueuedRequests)
+	go func() {
+		defer close(workerDone)
+		t.serveQueue(runCtx, queue)
+	}()
+	defer func() {
+		cancel()
+		<-workerDone
+	}()
+
+	if err := t.publishOffer(runCtx); err != nil {
 		log.Println("nostr: initial offer publish error:", err)
 	}
 
-	queue := make(chan gonostr.RelayEvent, t.cfg.MaxQueuedRequests)
-	go t.serveQueue(ctx, queue)
-
-	sub := t.pool.SubscribeMany(ctx, t.cfg.Relays, gonostr.Filter{
+	sub := t.pool.SubscribeMany(runCtx, t.cfg.Relays, gonostr.Filter{
 		Kinds: []int{KindRequest},
 		Tags:  gonostr.TagMap{"p": []string{t.cfg.PublicKey}},
 	})
@@ -156,10 +179,10 @@ func (t *Transport) Run(ctx context.Context) error {
 
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-runCtx.Done():
+			return runCtx.Err()
 		case <-ticker.C:
-			if err := t.publishOffer(ctx); err != nil {
+			if err := t.publishOffer(runCtx); err != nil {
 				log.Println("nostr: offer publish error:", err)
 			}
 		case ev, ok := <-sub:
@@ -209,9 +232,22 @@ func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
 		log.Println("nostr: bad request signature", evt.ID)
 		return
 	}
+	now := t.now()
+	createdAt := time.Unix(int64(evt.CreatedAt), 0)
+	if evt.Kind != KindRequest ||
+		createdAt.Before(now.Add(-requestFreshness)) ||
+		createdAt.After(now.Add(requestFutureSkew)) ||
+		!hasTagValue(evt.Tags, "p", t.cfg.PublicKey) {
+		log.Println("nostr: invalid request envelope", evt.ID)
+		return
+	}
 	// Enforce the request proof of work we advertise (DoS protection).
 	if err := nip13.Check(evt.ID, t.cfg.Offer.MinRequestPoW); err != nil {
 		log.Println("nostr: request below required proof of work", evt.ID)
+		return
+	}
+	if !t.markRequestSeen(evt.ID, now) {
+		log.Println("nostr: duplicate request event", evt.ID)
 		return
 	}
 	if nip13.CommittedDifficulty(evt) < t.cfg.Offer.MinRequestPoW {
@@ -239,6 +275,35 @@ func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
 	t.reply(ctx, evt, convKey, resp)
 }
 
+func hasTagValue(tags gonostr.Tags, name, value string) bool {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == name && tag[1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Transport) markRequestSeen(id string, now time.Time) bool {
+	t.seenMu.Lock()
+	defer t.seenMu.Unlock()
+
+	cutoff := now.Add(-requestFreshness)
+	for seenID, seenAt := range t.seenRequests {
+		if seenAt.Before(cutoff) {
+			delete(t.seenRequests, seenID)
+		}
+	}
+	if _, ok := t.seenRequests[id]; ok {
+		return false
+	}
+	if len(t.seenRequests) >= maxSeenRequests {
+		return false
+	}
+	t.seenRequests[id] = now
+	return true
+}
+
 // reply encrypts resp and publishes it as a kind 21822 response addressed to the
 // requester.
 func (t *Transport) reply(ctx context.Context, reqEvt *gonostr.Event, convKey [32]byte, resp Response) {
@@ -264,9 +329,12 @@ func (t *Transport) reply(ctx context.Context, reqEvt *gonostr.Event, convKey [3
 	}
 	// A light proof of work keeps responses acceptable to relays enforcing a floor.
 	if t.responsePoWTarget > 0 {
-		if nonceTag, err := nip13.DoWork(ctx, evt, t.responsePoWTarget); err == nil {
-			evt.Tags = append(evt.Tags, nonceTag)
+		nonceTag, err := nip13.DoWork(ctx, evt, t.responsePoWTarget)
+		if err != nil {
+			log.Println("nostr: response proof of work error", err)
+			return
 		}
+		evt.Tags = append(evt.Tags, nonceTag)
 	}
 	if err := evt.Sign(t.cfg.SecretKey); err != nil {
 		log.Println("nostr: sign response error", err)

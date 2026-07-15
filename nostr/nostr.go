@@ -64,6 +64,7 @@ const (
 	FeatureWrapBolt11Blinded = "wrap_bolt11_blinded"
 	FeaturePayBolt12         = "pay_bolt12"
 	FeatureWrapBolt12        = "wrap_bolt12"
+	FeatureRequestIDV1       = "request_id_v1"
 )
 
 // Offer is the JSON content of a kind 38421 advertisement.

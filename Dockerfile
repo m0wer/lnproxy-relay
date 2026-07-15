@@ -17,4 +17,5 @@ RUN apk add --no-cache ca-certificates tzdata \
 USER lnproxy
 WORKDIR /home/lnproxy
 COPY --from=build /out/nostr-relay /usr/local/bin/nostr-relay
+EXPOSE 4747
 ENTRYPOINT ["nostr-relay"]

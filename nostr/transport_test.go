@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,6 +66,24 @@ func validDecodedInvoice() *lnc.DecodedInvoice {
 type fakePool struct {
 	incoming  chan gonostr.RelayEvent
 	published chan *gonostr.Event
+}
+
+type countingWrapHandler struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (h *countingWrapHandler) Wrap(Request) Response {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	return Response{ProxyInvoice: "lnbc-proxy-invoice"}
+}
+
+func (h *countingWrapHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls
 }
 
 func newFakePool() *fakePool {
@@ -248,6 +267,73 @@ func TestTransportDropsLowPoWRequest(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		// good: nothing published
+	}
+}
+
+func TestTransportDeduplicatesRequestEvents(t *testing.T) {
+	handler := &countingWrapHandler{}
+	transport, pool, id := newTestTransport(t, handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+
+	event := buildClientRequest(t, id.PublicKey, Request{Method: MethodWrap, Invoice: "lnbc1..."}, 0)
+	pool.incoming <- event
+	pool.incoming <- event
+	waitForPublished(t, pool, KindResponse)
+	time.Sleep(50 * time.Millisecond)
+	if got := handler.count(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+}
+
+func TestTransportRejectsStaleAndMisaddressedRequests(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func(t *testing.T, transport *Transport, id Identity) gonostr.RelayEvent
+	}{
+		{
+			name: "stale",
+			build: func(t *testing.T, transport *Transport, id Identity) gonostr.RelayEvent {
+				transport.now = func() time.Time { return time.Now().Add(10 * time.Minute) }
+				return buildClientRequest(t, id.PublicKey, Request{Method: MethodWrap, Invoice: "lnbc1..."}, 0)
+			},
+		},
+		{
+			name: "misaddressed",
+			build: func(t *testing.T, _ *Transport, _ Identity) gonostr.RelayEvent {
+				otherSK := gonostr.GeneratePrivateKey()
+				otherPK, err := gonostr.GetPublicKey(otherSK)
+				if err != nil {
+					t.Fatalf("other pubkey: %v", err)
+				}
+				return buildClientRequest(t, otherPK, Request{Method: MethodWrap, Invoice: "lnbc1..."}, 0)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &countingWrapHandler{}
+			transport, pool, id := newTestTransport(t, handler)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go transport.Run(ctx)
+			waitForPublished(t, pool, KindOffer)
+			pool.incoming <- test.build(t, transport, id)
+
+			select {
+			case event := <-pool.published:
+				if event.Kind == KindResponse {
+					t.Fatal("unexpected response to invalid request")
+				}
+			case <-time.After(200 * time.Millisecond):
+			}
+			if got := handler.count(); got != 0 {
+				t.Fatalf("handler calls = %d, want 0", got)
+			}
+		})
 	}
 }
 
