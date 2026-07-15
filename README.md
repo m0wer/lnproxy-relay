@@ -6,7 +6,6 @@ This program uses the lnd REST API to handle lightning things so you'll need an 
 for example:
 
 	restlisten=localhost:8080
-
 To configure the relay follow the usage instructions:
 
 	usage: ./lnproxy [flags] lnproxy.macaroon
@@ -62,7 +61,89 @@ to get the onion url and try:
 		--data '{"invoice":"<bolt11 invoice>"}' \
 		http://<your .onion url>/spec
 
-Once you're happy with it, make a PR to add your url to: https://github.com/lnproxy/lnproxy-webui2/blob/main/assets/relays.json
+HTTP clients must configure this endpoint explicitly. The current lnproxy web
+UI discovers providers over nostr and does not bundle an HTTP relay directory.
+
+## Configuring your fees and limits
+
+By default the relay charges a small base fee plus a proportional fee and
+accepts invoices between 10 sats and 1,000,000 sats. Operators can set their own
+fees and amount limits without recompiling, via flags or environment variables
+(the flag wins when set, otherwise the environment variable, otherwise the
+built-in default):
+
+| flag | env var | meaning |
+|---|---|---|
+| `-min-msat` | `LNPROXY_MIN_MSAT` | minimum invoice amount (msat) |
+| `-max-msat` | `LNPROXY_MAX_MSAT` | maximum invoice amount (msat) |
+| `-base-fee-msat` | `LNPROXY_BASE_FEE_MSAT` | relay base fee (msat) |
+| `-fee-ppm` | `LNPROXY_FEE_PPM` | relay proportional fee (ppm) |
+| `-max-expiry` | `LNPROXY_MAX_EXPIRY` | maximum proxy invoice expiry (seconds) |
+
+For example, to cap proxied amounts at 500,000 sats and charge 0.2%:
+
+	./lnproxy-http-relay ... -max-msat 500000000 -fee-ppm 2000
+
+## Advertising over nostr (decentralized discovery)
+
+The `nostr-relay` binary advertises your relay on
+[nostr](https://github.com/nostr-protocol/nips) so clients can discover it
+without you having to get your URL added to a list, and serves wrap requests
+over encrypted nostr messages. See the protocol in
+[the spec](https://github.com/lnproxy/spec/blob/main/nostr.md).
+
+It uses the same lnd setup as the HTTP relay, plus two extra macaroon
+permissions for node attestation (omit them if you pass `-disable-ln-signing`):
+
+	lncli bakemacaroon --save_to lnproxy.macaroon \
+		uri:/lnrpc.Lightning/DecodePayReq \
+		uri:/lnrpc.Lightning/LookupInvoice \
+		uri:/lnrpc.Lightning/SignMessage \
+		uri:/lnrpc.Lightning/GetInfo \
+		uri:/invoicesrpc.Invoices/AddHoldInvoice \
+		uri:/invoicesrpc.Invoices/SubscribeSingleInvoice \
+		uri:/invoicesrpc.Invoices/CancelInvoice \
+		uri:/invoicesrpc.Invoices/SettleInvoice \
+		uri:/routerrpc.Router/SendPaymentV2 \
+		uri:/routerrpc.Router/EstimateRouteFee \
+		uri:/chainrpc.ChainKit/GetBestBlock
+
+Run it:
+
+	./nostr-relay -nostr-relays wss://nos.lol,wss://relay.damus.io lnproxy.macaroon
+
+Or build the container image directly from this repository (no sibling `lnc`
+checkout or parent-directory build context is required):
+
+	docker build -t lnproxy-nostr-relay .
+
+Useful flags (all fee/limit flags above also apply):
+
+| flag | meaning |
+|---|---|
+| `-nostr-relays` (env `LNPROXY_NOSTR_RELAYS`) | comma-separated relay URLs (working defaults built in) |
+| `-nostr-key` | path to the persistent identity key (created if absent) |
+| `-network` (env `LNPROXY_NETWORK`) | `mainnet`/`testnet`/`signet`/`regtest`; validated at startup, offers are tagged with it so clients on other networks never see them |
+| `-features` | advertised feature flags, e.g. `pay_bolt11,wrap_bolt11` |
+| `-min-request-pow` | NIP-13 difficulty required from clients (DoS protection) |
+| `-announce-pow` | NIP-13 difficulty mined into each offer |
+| `-disable-ln-signing` | do not attest the nostr identity with your node key |
+| `-identity-pow` | anonymous identity proof of work bits (used with `-disable-ln-signing`) |
+| `-urls` | optional HTTP/onion endpoints to also advertise |
+
+By default the relay attests its nostr identity with its lightning node key, so
+clients can verify that the advertisement belongs to a real node. A standard
+proxy invoice already reveals the relay's node id to the client, so this leaks
+nothing new. If you only ever issue blinded or BOLT12 proxy invoices and want to
+keep your node id private, run with `-disable-ln-signing` and optionally
+`-identity-pow` instead.
+
+Note on privacy: as a relay operator you see the invoices you are asked to pay
+(their destination, amount, and description/memo unless the client strips it),
+but you do not learn who is paying or where the payment comes from. This is the
+same destination-side exposure analyzed by Kappos et al., *An Empirical Analysis
+of Privacy in the Lightning Network* (USENIX Security 2021); the payer remains
+hidden from you.
 
 ## Operating your relay
 
@@ -100,3 +181,19 @@ and then lookup their associated payments using the payment hash (`r_hash`).
 If the payment was completed you should have a preimage you can use to
 settle the `ACCEPTED` invoice.  If the payment failed, no funds are at risk,
 you can cancel the hodl invoice.
+
+## Development
+
+Unit tests use a mocked lightning node, so they need no external services:
+
+	go test ./...
+
+The nostr transport also has an integration test that runs against a real
+nostr relay in Docker, exercising the publish/subscribe, NIP-44 encryption and
+NIP-13 proof-of-work paths over the wire:
+
+	docker compose -f docker-compose.test.yml up -d
+	LNPROXY_TEST_NOSTR_RELAY=ws://127.0.0.1:7777 go test -tags=integration ./nostr/...
+	docker compose -f docker-compose.test.yml down -v
+
+The integration test is skipped when `LNPROXY_TEST_NOSTR_RELAY` is unset.

@@ -1,0 +1,70 @@
+name: Go
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lnproxy-relay
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: gofmt
+        working-directory: lnproxy-relay
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        working-directory: lnproxy-relay
+        run: go vet ./...
+      - name: build
+        working-directory: lnproxy-relay
+        run: go build ./...
+      - name: build nostr relay image
+        working-directory: lnproxy-relay
+        run: docker build -t lnproxy-nostr-relay:test .
+      - name: test
+        working-directory: lnproxy-relay
+        run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lnproxy-relay
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: start nostr relay
+        working-directory: lnproxy-relay
+        run: docker compose -f docker-compose.test.yml up -d --wait || docker compose -f docker-compose.test.yml up -d
+      - name: integration tests
+        working-directory: lnproxy-relay
+        env:
+          LNPROXY_TEST_NOSTR_RELAY: ws://127.0.0.1:7777
+        run: go test -tags=integration ./nostr/...
+      - name: stop nostr relay
+        if: always()
+        working-directory: lnproxy-relay
+        run: docker compose -f docker-compose.test.yml down -v
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lnproxy-relay
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install pre-commit
+      - name: pre-commit
+        working-directory: lnproxy-relay
+        run: pre-commit run --all-files
