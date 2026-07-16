@@ -29,6 +29,11 @@ jobs:
       - name: build nostr relay image
         working-directory: lnproxy-relay
         run: docker build -t lnproxy-nostr-relay:test .
+      - name: validate Tor deployment example
+        working-directory: lnproxy-relay
+        run: |
+          bash -n examples/tor/bake-macaroon.sh
+          docker compose -f examples/tor/docker-compose.yml config --quiet
       - name: test
         working-directory: lnproxy-relay
         run: go test -race ./...

@@ -40,10 +40,12 @@ and on a separate terminal, test with:
 		--data '{"invoice":"<bolt11 invoice>"}' \
 		http://localhost:4747/spec
 
-## Expose your relay over tor
+## Expose the HTTP relay with a static Tor service
 
-If you know how to run a server you can put your relay behind a reverse proxy and and expose it to the internet.
-A simpler route is to use tor.
+If you know how to run a server you can put the HTTP relay behind a reverse
+proxy and expose it to the Internet. A simpler route for the standalone HTTP
+binary is a static Tor onion service. Nostr providers should normally use the
+integrated ephemeral service documented below instead.
 
 Install tor, then edit `/etc/tor/torrc` to add:
 
@@ -136,6 +138,16 @@ Useful flags (all fee/limit flags above also apply):
 | `-http-max-concurrent` (env `LNPROXY_HTTP_MAX_CONCURRENT`) | concurrent direct handlers (default 8) |
 | `-http-request-interval` (env `LNPROXY_HTTP_REQUEST_INTERVAL`) | global direct request interval (default 5s) |
 | `-http-request-burst` (env `LNPROXY_HTTP_REQUEST_BURST`) | direct request burst capacity (default 3) |
+| `-tor` (env `LNPROXY_TOR`) | enable Tor using the default local addresses; off by default |
+| `-tor-proxy` (env `LNPROXY_TOR_PROXY`) | proxy Nostr WebSockets through Tor when enabled (default true) |
+| `-tor-hidden-service` (env `LNPROXY_TOR_HIDDEN_SERVICE`) | create and advertise an ephemeral v3 onion endpoint (default true) |
+| `-tor-socks` (env `LNPROXY_TOR_SOCKS`) | Tor SOCKS5 address (default `127.0.0.1:9050`) |
+| `-tor-socks-username` (env `LNPROXY_TOR_SOCKS_USERNAME`) | optional SOCKS5 username for Tor circuit isolation |
+| `-tor-socks-password` (env `LNPROXY_TOR_SOCKS_PASSWORD`) | optional SOCKS5 password for Tor circuit isolation |
+| `-tor-control` (env `LNPROXY_TOR_CONTROL`) | Tor control address (default `127.0.0.1:9051`) |
+| `-tor-control-password` (env `LNPROXY_TOR_CONTROL_PASSWORD`) | optional control password (default uses SAFECOOKIE) |
+| `-tor-target` (env `LNPROXY_TOR_TARGET`) | hidden-service target (defaults to the direct listener on loopback) |
+| `-tor-virtual-port` (env `LNPROXY_TOR_VIRTUAL_PORT`) | onion-service virtual port (default 80) |
 
 By default the relay attests its nostr identity with its lightning node key, so
 clients can verify that the advertisement belongs to a real node. A standard
@@ -170,6 +182,83 @@ clearnet client also exposes its IP unless it uses a proxy. Nostr transport hide
 that IP from the provider only when the Nostr relay does not disclose or share
 connection metadata. A direct onion endpoint over Tor avoids both third-party
 relay metadata and disclosure of the client IP to the provider.
+
+### Recommended anonymous deployment with Tor
+
+Anonymous providers should enable both Tor functions: Nostr WebSocket
+connections use SOCKS5, and an ephemeral v3 onion service forwards port 80 to
+the integrated direct endpoint. The generated `http://...onion/spec` URL is
+automatically added to the offer. Its key is discarded and its lifetime is
+bound to the authenticated control connection, so the onion address changes
+when the relay restarts. The persistent Nostr identity does not change.
+
+With a system Tor installation, enable a local SOCKS listener and authenticated
+control port in `torrc`:
+
+	SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+	ControlPort 127.0.0.1:9051
+	CookieAuthentication 1
+	CookieAuthFileGroupReadable 1
+
+Then run:
+
+	./nostr-relay \
+		-tor \
+		-http-listen 127.0.0.1:4747 \
+		lnproxy.macaroon
+
+This uses the relay's default Tor addresses (`127.0.0.1:9050` and
+`127.0.0.1:9051`); Tor's control port is disabled until configured. The relay
+process must be able to read the SAFECOOKIE path returned by Tor's
+`PROTOCOLINFO`; on packaged installations this normally means adding its user
+to the dedicated Tor control group. Restrict that group's membership and
+protect the cookie as a secret because it grants control over the Tor process.
+
+Tor control password authentication is also supported. Generate the hash with
+`tor --hash-password`, configure the result as `HashedControlPassword`, and
+pass the original password through `LNPROXY_TOR_CONTROL_PASSWORD`. Environment
+variables are preferable to command-line secrets because process arguments may
+be visible to other local users. Tor control authentication has no username.
+
+Optional `LNPROXY_TOR_SOCKS_USERNAME` and `LNPROXY_TOR_SOCKS_PASSWORD` values
+must be set together. Tor accepts these SOCKS5 values and, with
+`IsolateSOCKSAuth`, uses them to isolate this application's circuits; they are
+not an access-control replacement for firewalling the SOCKS port. Set
+`LNPROXY_TOR_PROXY=false` or `LNPROXY_TOR_HIDDEN_SERVICE=false` only when one
+half of the integration is intentionally not needed.
+
+For a containerized signet example:
+
+	cd examples/tor
+	docker compose up -d --build
+	docker compose logs -f tor lnproxy
+
+The example uses the version-pinned
+[`m0wer/docker-tor`](https://github.com/m0wer/docker-tor) image and named
+volumes for node data, relay credentials, the Nostr identity, Tor state, and
+the control cookie. The lnproxy container has no Internet-connected interface.
+It reaches LND on one internal network and Tor on another; only the Tor
+container bridges the Tor-internal network to its outbound network. Tor, LND,
+and bitcoind use separate outbound networks to prevent lateral access between
+them. Read-only root filesystems for Tor and lnproxy, minimized capabilities,
+`no-new-privileges`, bounded process counts, safe Tor logging, and a separately
+shared read-only control-cookie volume reduce the effect of a relay compromise.
+LND and bitcoind require a small capability set for their image entrypoints and
+outbound access for Bitcoin and Lightning peers, but they do not route traffic
+for lnproxy.
+
+Do not attach the lnproxy service to any of the Compose egress networks. The code
+uses a SOCKS-only transport with remote hostname resolution and no direct
+fallback, while the internal Docker network provides enforcement if a future
+code path accidentally attempts direct egress. The onion endpoint uses HTTP
+intentionally: onion services provide end-to-end authentication and encryption
+inside Tor.
+
+Providers that already advertise a clearnet domain or IP do not gain operator
+anonymity by proxying their public Nostr connections. They should normally
+leave `-tor` disabled and connect to Nostr relays directly for lower latency,
+while putting any advertised clearnet `/spec` endpoint behind HTTPS and a
+hardened reverse proxy.
 
 ## Operating your relay
 
