@@ -115,6 +115,9 @@ services:
     user: "1000:1000"
     command:
       - tor
+      - --ignore-missing-torrc
+      - -f
+      - /nonexistent
       - --SocksPort
       - "0.0.0.0:9050 IsolateSOCKSAuth"
       - --ControlPort
@@ -183,6 +186,7 @@ services:
       LNPROXY_TOR_SOCKS_USERNAME: lnproxy-nostr
       LNPROXY_TOR_SOCKS_PASSWORD: replace-with-random-value
       LNPROXY_TOR_CONTROL: tor:9051
+      LNPROXY_TOR_CONTROL_COOKIE: /run/tor-control/control_auth_cookie
       LNPROXY_TOR_TARGET: lnproxy:4747
     command:
       - --nostr-key=/home/lnproxy/lnproxy-nostr.key
@@ -192,9 +196,9 @@ services:
     volumes:
       - relay-data:/home/lnproxy
       - relay-credentials:/credentials:ro
-      # SAFECOOKIE requires the cookie at the path Tor reports through
-      # PROTOCOLINFO. No other Tor state is exposed to this container.
-      - tor-control:/var/run/tor:ro
+      # The controller-local path intentionally differs from Tor's reported
+      # path and is selected by LNPROXY_TOR_CONTROL_COOKIE.
+      - tor-control:/run/tor-control:ro
     networks:
       - node-internal
       - tor-internal

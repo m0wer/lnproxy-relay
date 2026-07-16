@@ -111,6 +111,7 @@ func main() {
 	torSOCKSPasswordFlag := flag.String("tor-socks-password", "", "optional Tor SOCKS password for stream isolation")
 	torControlFlag := flag.String("tor-control", "127.0.0.1:9051", "Tor control address")
 	torControlPasswordFlag := flag.String("tor-control-password", "", "optional Tor control password (empty uses SAFECOOKIE)")
+	torControlCookieFlag := flag.String("tor-control-cookie", "", "local path to Tor SAFECOOKIE file (default path reported by Tor)")
 	torTargetFlag := flag.String("tor-target", "", "hidden-service target (default derived from -http-listen)")
 	torVirtualPortFlag := flag.Int("tor-virtual-port", 80, "port exposed by the ephemeral onion service")
 
@@ -292,12 +293,14 @@ func main() {
 		SOCKSPassword:   envOr("LNPROXY_TOR_SOCKS_PASSWORD", *torSOCKSPasswordFlag),
 		ControlAddress:  envOr("LNPROXY_TOR_CONTROL", *torControlFlag),
 		ControlPassword: envOr("LNPROXY_TOR_CONTROL_PASSWORD", *torControlPasswordFlag),
+		ControlCookie:   envOr("LNPROXY_TOR_CONTROL_COOKIE", *torControlCookieFlag),
 		TargetAddress:   torTarget,
 		VirtualPort:     torVirtualPort,
 	}
 	if err := torCfg.validate(httpListen); err != nil {
 		log.Fatalln("invalid Tor configuration:", err)
 	}
+	logTorStartup(log.Default(), torCfg)
 	if torCfg.Enabled && torCfg.ProxyNostr {
 		torClient, err := newTorHTTPClient(torCfg.SOCKSAddress, torCfg.SOCKSUsername, torCfg.SOCKSPassword)
 		if err != nil {
@@ -306,7 +309,6 @@ func main() {
 		// go-nostr uses http.DefaultClient for WebSocket handshakes. This
 		// dedicated transport has no direct-network fallback.
 		http.DefaultClient = torClient
-		log.Println("nostr connections are restricted to Tor SOCKS at", torCfg.SOCKSAddress)
 	}
 	urlsCSV := *urlsFlag
 	if urlsCSV == "" {
@@ -320,7 +322,6 @@ func main() {
 			log.Fatalln("Tor hidden-service setup failed:", err)
 		}
 		urls = appendUnique(urls, onionService.URL())
-		log.Println("created ephemeral onion endpoint:", onionService.URL())
 	}
 	features := splitCSV(*featuresFlag)
 	if httpListen != "" && len(urls) > 0 {
@@ -337,6 +338,11 @@ func main() {
 		Features:         features,
 		URLs:             urls,
 	}
+	onionURL := ""
+	if onionService != nil {
+		onionURL = onionService.URL()
+	}
+	logAdvertisedURLs(log.Default(), onionURL, offer.URLs)
 
 	// Optional LN node attestation binds this nostr identity to the node.
 	if !*disableLNSigningFlag {

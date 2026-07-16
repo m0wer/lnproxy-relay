@@ -146,6 +146,7 @@ Useful flags (all fee/limit flags above also apply):
 | `-tor-socks-password` (env `LNPROXY_TOR_SOCKS_PASSWORD`) | optional SOCKS5 password for Tor circuit isolation |
 | `-tor-control` (env `LNPROXY_TOR_CONTROL`) | Tor control address (default `127.0.0.1:9051`) |
 | `-tor-control-password` (env `LNPROXY_TOR_CONTROL_PASSWORD`) | optional control password (default uses SAFECOOKIE) |
+| `-tor-control-cookie` (env `LNPROXY_TOR_CONTROL_COOKIE`) | local SAFECOOKIE path when it differs from the path reported by Tor |
 | `-tor-target` (env `LNPROXY_TOR_TARGET`) | hidden-service target (defaults to the direct listener on loopback) |
 | `-tor-virtual-port` (env `LNPROXY_TOR_VIRTUAL_PORT`) | onion-service virtual port (default 80) |
 
@@ -196,8 +197,10 @@ With a system Tor installation, enable a local SOCKS listener and authenticated
 control port in `torrc`:
 
 	SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+	DataDirectory /var/lib/tor
 	ControlPort 127.0.0.1:9051
 	CookieAuthentication 1
+	CookieAuthFile /var/run/tor/control_auth_cookie
 	CookieAuthFileGroupReadable 1
 
 Then run:
@@ -209,10 +212,28 @@ Then run:
 
 This uses the relay's default Tor addresses (`127.0.0.1:9050` and
 `127.0.0.1:9051`); Tor's control port is disabled until configured. The relay
-process must be able to read the SAFECOOKIE path returned by Tor's
-`PROTOCOLINFO`; on packaged installations this normally means adding its user
-to the dedicated Tor control group. Restrict that group's membership and
-protect the cookie as a secret because it grants control over the Tor process.
+process must be able to read the SAFECOOKIE at the path returned by Tor's
+`PROTOCOLINFO`, or at the local override path documented below. On packaged
+installations this normally means adding its user to the dedicated Tor control
+group. Restrict that group's membership and protect the cookie as a secret
+because it grants control over the Tor process.
+
+`PROTOCOLINFO` reports an absolute `COOKIEFILE` path in Tor's filesystem
+namespace. If Tor and the relay run in different containers, either mount the
+shared cookie at that same absolute path in both containers or set
+`LNPROXY_TOR_CONTROL_COOKIE` to the relay container's local path. The override
+changes only where the relay reads the cookie; SAFECOOKIE still verifies that
+its contents match the cookie held by Tor. Do not set the override together
+with `LNPROXY_TOR_CONTROL_PASSWORD`. For example, if the cookie volume is
+mounted at `/run/tor-control` in the relay container:
+
+	LNPROXY_TOR_CONTROL_COOKIE=/run/tor-control/control_auth_cookie
+
+If `DataDirectory` is omitted from a host-managed `torrc`, this image runs as a
+user whose home is `/data`, so Tor defaults to `/data/.tor` and reports
+`/data/.tor/control_auth_cookie`. Mounting `/var/run/tor` alone does not change
+that default. Set both `DataDirectory` and `CookieAuthFile` explicitly as shown
+above.
 
 Tor control password authentication is also supported. Generate the hash with
 `tor --hash-password`, configure the result as `HashedControlPassword`, and
@@ -233,6 +254,28 @@ For a containerized signet example:
 	docker compose up -d --build
 	docker compose logs -f tor lnproxy
 
+At startup, the relay logs whether Tor is enabled, whether Nostr uses SOCKS,
+the control authentication method, the generated onion endpoint, and the exact
+direct URL list placed in the offer. For example:
+
+	tor: enabled; Nostr proxy=true ephemeral hidden service=true
+	tor: Nostr relay connections use SOCKS5 at tor:9050 (SOCKS credentials configured=true, direct fallback disabled)
+	tor: control=tor:9051 authentication=SAFECOOKIE local-cookie=/run/tor-control/control_auth_cookie; ephemeral v3 port 80 targets lnproxy:4747
+	tor: onion endpoint advertised in offer: http://<v3-address>.onion/spec
+	offer: advertised direct URLs: [http://<v3-address>.onion/spec]
+
+SOCKS credentials enable stream isolation only when Tor's listener also uses
+`IsolateSOCKSAuth`, as the Compose example does. Values in `LNPROXY_URLS` are
+published in the Nostr offer and logged at startup. Do not put credentials,
+access tokens, or other secrets in those URLs.
+
+Current binaries emit either `tor: enabled` or `tor: disabled` after validating
+the relay and Tor configuration. If neither appears, inspect preceding logs:
+the process exited before Tor setup or the image predates Tor support. If it
+reports `tor: disabled` unexpectedly, check the rendered environment with
+`docker compose config`, then recreate the container. Rebuild a local image
+with `docker compose build --no-cache lnproxy` when its source changed.
+
 The example uses the version-pinned
 [`m0wer/docker-tor`](https://github.com/m0wer/docker-tor) image and named
 volumes for node data, relay credentials, the Nostr identity, Tor state, and
@@ -246,6 +289,16 @@ shared read-only control-cookie volume reduce the effect of a relay compromise.
 LND and bitcoind require a small capability set for their image entrypoints and
 outbound access for Bitcoin and Lightning peers, but they do not route traffic
 for lnproxy.
+
+The Tor image's unprivileged user has `/data` as its home, and Tor otherwise
+defaults its data directory to `/data/.tor`. The example explicitly sets
+`DataDirectory /var/lib/tor`, so `/data` can remain read-only and Tor state is
+kept in a named volume. Operators who manage `torrc` on the host must likewise
+set `DataDirectory /var/lib/tor`; they can mount `/etc/tor` read-only and mount
+host-owned data and runtime directories at `/var/lib/tor` and `/var/run/tor`.
+Those directories must be owned by UID/GID `1000:1000` and should not be shared
+with any container except the relay's read-only access to the control-cookie
+runtime directory.
 
 Do not attach the lnproxy service to any of the Compose egress networks. The code
 uses a SOCKS-only transport with remote hostname resolution and no direct
