@@ -5,8 +5,10 @@ go 1.24.1
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0
+	github.com/cretz/bine v0.2.0
 	github.com/lnproxy/lnc v0.0.0-20230930205402-94fc9a14671c
 	github.com/nbd-wtf/go-nostr v0.52.3
+	golang.org/x/net v0.37.0
 )
 
 require (
@@ -31,6 +33,5 @@ require (
 	golang.org/x/arch v0.15.0 // indirect
 	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
-	golang.org/x/net v0.37.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 )

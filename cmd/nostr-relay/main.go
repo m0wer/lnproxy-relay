@@ -75,6 +75,15 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 	return parsed, nil
 }
 
+func envBool(key string, fallback bool) (bool, error) {
+	value := envOr(key, strconv.FormatBool(fallback))
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
 func main() {
 	lndHostStringFlag := flag.String("lnd", "https://127.0.0.1:8080", "host for lnd's REST api")
 	lndCertPathFlag := flag.String("lnd-cert", ".lnd/tls.cert", "lnd's self-signed cert (empty string for no-rest-tls=true)")
@@ -94,6 +103,16 @@ func main() {
 	httpMaxConcurrentFlag := flag.Int("http-max-concurrent", 8, "maximum concurrent direct HTTP wrap handlers")
 	httpRequestIntervalFlag := flag.Duration("http-request-interval", 5*time.Second, "global interval between direct HTTP requests (0 disables)")
 	httpRequestBurstFlag := flag.Int("http-request-burst", 3, "initial and maximum direct HTTP request burst")
+	torFlag := flag.Bool("tor", false, "use Tor for nostr connections and an ephemeral onion endpoint (or LNPROXY_TOR)")
+	torProxyFlag := flag.Bool("tor-proxy", true, "proxy nostr relay connections through Tor when Tor is enabled")
+	torHiddenServiceFlag := flag.Bool("tor-hidden-service", true, "create and advertise an ephemeral v3 onion service when Tor is enabled")
+	torSOCKSFlag := flag.String("tor-socks", "127.0.0.1:9050", "Tor SOCKS5 address")
+	torSOCKSUsernameFlag := flag.String("tor-socks-username", "", "optional Tor SOCKS username for stream isolation")
+	torSOCKSPasswordFlag := flag.String("tor-socks-password", "", "optional Tor SOCKS password for stream isolation")
+	torControlFlag := flag.String("tor-control", "127.0.0.1:9051", "Tor control address")
+	torControlPasswordFlag := flag.String("tor-control-password", "", "optional Tor control password (empty uses SAFECOOKIE)")
+	torTargetFlag := flag.String("tor-target", "", "hidden-service target (default derived from -http-listen)")
+	torVirtualPortFlag := flag.Int("tor-virtual-port", 80, "port exposed by the ephemeral onion service")
 
 	minMsatFlag := flag.Uint64("min-msat", 0, "minimum invoice amount in msat (0 = default/env)")
 	maxMsatFlag := flag.Uint64("max-msat", 0, "maximum invoice amount in msat (0 = default/env)")
@@ -124,6 +143,9 @@ func main() {
 		os.Exit(2)
 	}
 	flag.Parse()
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	lndHostString := envOr("LNPROXY_LND_HOST", *lndHostStringFlag)
 	lndCertPath := envOr("LNPROXY_LND_CERT", *lndCertPathFlag)
@@ -163,6 +185,22 @@ func main() {
 	}
 	if httpRequestBurst <= 0 {
 		log.Fatalln("direct HTTP request burst must be greater than zero")
+	}
+	torEnabled, err := envBool("LNPROXY_TOR", *torFlag)
+	if err != nil {
+		log.Fatalln("invalid Tor configuration:", err)
+	}
+	torProxy, err := envBool("LNPROXY_TOR_PROXY", *torProxyFlag)
+	if err != nil {
+		log.Fatalln("invalid Tor configuration:", err)
+	}
+	torHiddenService, err := envBool("LNPROXY_TOR_HIDDEN_SERVICE", *torHiddenServiceFlag)
+	if err != nil {
+		log.Fatalln("invalid Tor configuration:", err)
+	}
+	torVirtualPort, err := envInt("LNPROXY_TOR_VIRTUAL_PORT", *torVirtualPortFlag)
+	if err != nil {
+		log.Fatalln("invalid Tor configuration:", err)
 	}
 
 	network, err := nostr.ParseNetwork(envOr("LNPROXY_NETWORK", *networkFlag))
@@ -238,11 +276,52 @@ func main() {
 	log.Println("nostr public key:", identity.PublicKey)
 
 	httpListen := envOr("LNPROXY_HTTP_LISTEN", *httpListenFlag)
+	torTarget := envOr("LNPROXY_TOR_TARGET", *torTargetFlag)
+	if torEnabled && torHiddenService && torTarget == "" && httpListen != "" {
+		torTarget, err = defaultTorTarget(httpListen)
+		if err != nil {
+			log.Fatalln("invalid Tor configuration:", err)
+		}
+	}
+	torCfg := torConfig{
+		Enabled:         torEnabled,
+		ProxyNostr:      torProxy,
+		HiddenService:   torHiddenService,
+		SOCKSAddress:    envOr("LNPROXY_TOR_SOCKS", *torSOCKSFlag),
+		SOCKSUsername:   envOr("LNPROXY_TOR_SOCKS_USERNAME", *torSOCKSUsernameFlag),
+		SOCKSPassword:   envOr("LNPROXY_TOR_SOCKS_PASSWORD", *torSOCKSPasswordFlag),
+		ControlAddress:  envOr("LNPROXY_TOR_CONTROL", *torControlFlag),
+		ControlPassword: envOr("LNPROXY_TOR_CONTROL_PASSWORD", *torControlPasswordFlag),
+		TargetAddress:   torTarget,
+		VirtualPort:     torVirtualPort,
+	}
+	if err := torCfg.validate(httpListen); err != nil {
+		log.Fatalln("invalid Tor configuration:", err)
+	}
+	if torCfg.Enabled && torCfg.ProxyNostr {
+		torClient, err := newTorHTTPClient(torCfg.SOCKSAddress, torCfg.SOCKSUsername, torCfg.SOCKSPassword)
+		if err != nil {
+			log.Fatalln("invalid Tor proxy configuration:", err)
+		}
+		// go-nostr uses http.DefaultClient for WebSocket handshakes. This
+		// dedicated transport has no direct-network fallback.
+		http.DefaultClient = torClient
+		log.Println("nostr connections are restricted to Tor SOCKS at", torCfg.SOCKSAddress)
+	}
 	urlsCSV := *urlsFlag
 	if urlsCSV == "" {
 		urlsCSV = os.Getenv("LNPROXY_URLS")
 	}
 	urls := splitCSV(urlsCSV)
+	var onionService *ephemeralOnion
+	if torCfg.Enabled && torCfg.HiddenService {
+		onionService, err = createEphemeralOnion(ctx, torCfg)
+		if err != nil {
+			log.Fatalln("Tor hidden-service setup failed:", err)
+		}
+		urls = appendUnique(urls, onionService.URL())
+		log.Println("created ephemeral onion endpoint:", onionService.URL())
+	}
 	features := splitCSV(*featuresFlag)
 	if httpListen != "" && len(urls) > 0 {
 		features = appendUnique(features, nostr.FeatureRequestIDV1)
@@ -285,9 +364,6 @@ func main() {
 		OfferInterval:     *offerIntervalFlag,
 	}
 
-	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
-
 	pool := gonostr.NewSimplePool(ctx)
 	server := nostr.NewServer(lnproxyRelay, offer, identity.PublicKey)
 	transport := nostr.NewTransport(cfg, pool, server)
@@ -323,7 +399,7 @@ func main() {
 		}
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	transportDone := make(chan struct{})
 	go func() {
 		defer close(transportDone)
@@ -349,6 +425,16 @@ func main() {
 			}
 		}()
 	}
+	var onionDone chan struct{}
+	if onionService != nil {
+		onionDone = make(chan struct{})
+		go func() {
+			defer close(onionDone)
+			if err := onionService.Watch(ctx); err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -364,6 +450,12 @@ func main() {
 		<-directDone
 	}
 	<-transportDone
+	if onionService != nil {
+		<-onionDone
+		if err := onionService.Close(); err != nil {
+			log.Println("Tor hidden-service shutdown error:", err)
+		}
+	}
 	log.Println("waiting for open circuits...")
 	lnproxyRelay.WaitGroup.Wait()
 	log.Println("shutdown complete")

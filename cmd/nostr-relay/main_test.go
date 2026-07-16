@@ -50,3 +50,23 @@ func TestEnvDuration(t *testing.T) {
 		}
 	})
 }
+
+func TestEnvBool(t *testing.T) {
+	t.Run("fallback", func(t *testing.T) {
+		if got, err := envBool("LNPROXY_TEST_BOOL", true); err != nil || !got {
+			t.Fatalf("envBool() = %t, %v, want true, nil", got, err)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("LNPROXY_TEST_BOOL", "false")
+		if got, err := envBool("LNPROXY_TEST_BOOL", true); err != nil || got {
+			t.Fatalf("envBool() = %t, %v, want false, nil", got, err)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		t.Setenv("LNPROXY_TEST_BOOL", "sometimes")
+		if _, err := envBool("LNPROXY_TEST_BOOL", true); err == nil {
+			t.Fatal("envBool() accepted an invalid boolean")
+		}
+	})
+}
