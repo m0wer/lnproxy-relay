@@ -123,6 +123,7 @@ Useful flags (all fee/limit flags above also apply):
 | flag | meaning |
 |---|---|
 | `-nostr-relays` (env `LNPROXY_NOSTR_RELAYS`) | comma-separated relay URLs (working defaults built in) |
+| `-advertised-nostr-relays` (env `LNPROXY_ADVERTISED_NOSTR_RELAYS`) | optional client-reachable aliases when provider relay URLs are internal |
 | `-nostr-key` | path to the persistent identity key (created if absent) |
 | `-network` (env `LNPROXY_NETWORK`) | `mainnet`/`testnet`/`signet`/`regtest`; validated at startup, offers are tagged with it so clients on other networks never see them |
 | `-features` | advertised feature flags, e.g. `pay_bolt11,wrap_bolt11` |

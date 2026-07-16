@@ -131,6 +131,25 @@ func TestTransportRepliesOnlyThroughSourceRelay(t *testing.T) {
 	}
 }
 
+func TestOfferUsesClientReachableRelayAliases(t *testing.T) {
+	transport, _, _ := newTestTransport(t, &countingWrapHandler{})
+	transport.cfg.Relays = []string{"ws://relay.internal:8080"}
+	transport.cfg.AdvertisedRelays = []string{"wss://relay.example"}
+	transport.cfg.AnnouncePoWTarget = 0
+
+	event, err := transport.buildOfferEvent(context.Background())
+	if err != nil {
+		t.Fatalf("build offer: %v", err)
+	}
+	var offer Offer
+	if err := json.Unmarshal([]byte(event.Content), &offer); err != nil {
+		t.Fatalf("parse offer: %v", err)
+	}
+	if len(offer.Relays) != 1 || offer.Relays[0] != "wss://relay.example" {
+		t.Fatalf("advertised relays = %v, want client-reachable alias", offer.Relays)
+	}
+}
+
 func newTestTransport(t *testing.T, handler WrapHandler) (*Transport, *fakePool, Identity) {
 	t.Helper()
 	id, err := LoadOrCreateIdentity(t.TempDir() + "/key")

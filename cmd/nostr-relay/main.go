@@ -81,6 +81,7 @@ func main() {
 
 	keyPathFlag := flag.String("nostr-key", "lnproxy-nostr.key", "path to persistent nostr secret key (created if absent)")
 	relaysFlag := flag.String("nostr-relays", "", "comma-separated nostr relay URLs (default built-in set or LNPROXY_NOSTR_RELAYS)")
+	advertisedRelaysFlag := flag.String("advertised-nostr-relays", "", "optional client-reachable aliases for nostr relays (or LNPROXY_ADVERTISED_NOSTR_RELAYS)")
 	networkFlag := flag.String("network", "mainnet", "bitcoin network: mainnet|testnet|signet|regtest (or LNPROXY_NETWORK)")
 	featuresFlag := flag.String("features", "pay_bolt11,pay_bolt11_blinded,wrap_bolt11", "comma-separated advertised feature flags")
 	minRequestPoWFlag := flag.Int("min-request-pow", 20, "minimum NIP-13 difficulty required on wrap requests")
@@ -133,6 +134,14 @@ func main() {
 	relays := splitCSV(relaysCSV)
 	if len(relays) == 0 {
 		log.Fatalln("no nostr relays configured")
+	}
+	advertisedRelaysCSV := *advertisedRelaysFlag
+	if advertisedRelaysCSV == "" {
+		advertisedRelaysCSV = os.Getenv("LNPROXY_ADVERTISED_NOSTR_RELAYS")
+	}
+	advertisedRelays := splitCSV(advertisedRelaysCSV)
+	if len(advertisedRelays) == 0 {
+		advertisedRelays = relays
 	}
 	httpMaxConcurrent, err := envInt("LNPROXY_HTTP_MAX_CONCURRENT", *httpMaxConcurrentFlag)
 	if err != nil {
@@ -269,6 +278,7 @@ func main() {
 		SecretKey:         identity.SecretKey,
 		PublicKey:         identity.PublicKey,
 		Relays:            relays,
+		AdvertisedRelays:  advertisedRelays,
 		Network:           network,
 		Offer:             offer,
 		AnnouncePoWTarget: *announcePoWFlag,
@@ -303,7 +313,7 @@ func main() {
 	log.Printf("relay limits: min=%d msat max=%d msat fee=%d msat + %d ppm",
 		lnproxyRelay.MinAmountMsat, lnproxyRelay.MaxAmountMsat,
 		lnproxyRelay.RoutingFeeBaseMsat, lnproxyRelay.RoutingFeePPM)
-	log.Printf("advertising %s features %v on relays %v", network, offer.Features, relays)
+	log.Printf("advertising %s features %v on relays %v", network, offer.Features, advertisedRelays)
 	if directServer != nil {
 		log.Printf("direct HTTP endpoint listening on %s; advertised URLs %v", directServer.Addr, offer.URLs)
 		log.Printf("direct HTTP limits: concurrent=%d interval=%s burst=%d",

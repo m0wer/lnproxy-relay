@@ -29,6 +29,9 @@ type Config struct {
 	PublicKey string
 	// Relays is the set of nostr relay URLs to publish offers to and listen on.
 	Relays []string
+	// AdvertisedRelays optionally contains client-reachable aliases for Relays.
+	// It is useful when the provider reaches a relay through an internal address.
+	AdvertisedRelays []string
 	// Network is the bitcoin network this provider serves.
 	Network Network
 	// Offer is the advertisement content (fees, limits, features, optional
@@ -106,7 +109,10 @@ func NewTransport(cfg Config, pool Pool, handler WrapHandler) *Transport {
 // configuration, mining the announcement proof of work.
 func (t *Transport) buildOfferEvent(ctx context.Context) (*gonostr.Event, error) {
 	offer := t.cfg.Offer
-	offer.Relays = t.cfg.Relays
+	offer.Relays = t.cfg.AdvertisedRelays
+	if len(offer.Relays) == 0 {
+		offer.Relays = t.cfg.Relays
+	}
 	content, err := json.Marshal(offer)
 	if err != nil {
 		return nil, err
