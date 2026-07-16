@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -11,11 +12,15 @@ import (
 
 // fakeLN is a minimal lnc.LN for exercising wrap() feature-flag handling.
 type fakeLN struct {
-	decoded *lnc.DecodedInvoice
+	decoded      *lnc.DecodedInvoice
+	addedInvoice lnc.InvoiceParameters
 }
 
 func (f *fakeLN) DecodeInvoice(string) (*lnc.DecodedInvoice, error) { return f.decoded, nil }
-func (f *fakeLN) AddInvoice(lnc.InvoiceParameters) (string, error)  { return "lnbc-proxy", nil }
+func (f *fakeLN) AddInvoice(invoice lnc.InvoiceParameters) (string, error) {
+	f.addedInvoice = invoice
+	return "lnbc-proxy", nil
+}
 func (f *fakeLN) WatchInvoice([]byte) (*lnc.InvoiceState, error) {
 	return &lnc.InvoiceState{State: lnc.Canceled}, nil
 }
@@ -75,6 +80,40 @@ func TestWrapRejectsUnknownFeature(t *testing.T) {
 	}
 }
 
+func TestWrapRejectsCustomRoutingAmountOverflow(t *testing.T) {
+	routingMsat := uint64(math.MaxUint64)
+	r := NewRelay(&fakeLN{decoded: decodedWithFeatures("8")})
+	_, _, err := r.wrap(ProxyParameters{Invoice: "lnbcrt1...", RoutingMsat: &routingMsat})
+	if !errors.Is(err, ClientFacing) {
+		t.Fatalf("wrap error = %v, want client-facing overflow rejection", err)
+	}
+}
+
+func TestWrapRejectsFeeScheduleOverflow(t *testing.T) {
+	r := NewRelay(&fakeLN{decoded: decodedWithFeatures("8")})
+	r.RoutingFeePPM = math.MaxUint64
+	_, _, err := r.wrap(ProxyParameters{Invoice: "lnbcrt1..."})
+	if !errors.Is(err, ClientFacing) {
+		t.Fatalf("wrap error = %v, want client-facing overflow rejection", err)
+	}
+}
+
+func TestWrapCapsOldInvoiceByRemainingLifetime(t *testing.T) {
+	decoded := decodedWithFeatures("8")
+	decoded.Timestamp = uint64(time.Now().Add(-2 * time.Hour).Unix())
+	decoded.Expiry = uint64((4 * time.Hour).Seconds())
+	r := NewRelay(&fakeLN{decoded: decoded})
+	r.MaxExpiry = uint64((7 * 24 * time.Hour).Seconds())
+	params, _, err := r.wrap(ProxyParameters{Invoice: "lnbcrt1..."})
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	wantMax := uint64((2 * time.Hour).Seconds()) - r.ExpiryBuffer
+	if params.Expiry > wantMax {
+		t.Fatalf("proxy expiry = %d, want at most remaining lifetime %d", params.Expiry, wantMax)
+	}
+}
+
 // recordingLN drives a full circuit: WatchInvoice returns an Accepted state with
 // a configurable CLTV delta, and it records whether the relay paid out or
 // canceled. PayInvoice succeeds with a preimage.
@@ -85,6 +124,30 @@ type recordingLN struct {
 	canceled     bool
 	settled      bool
 	gotCltvLimit uint64
+}
+
+type watchErrorLN struct {
+	*fakeLN
+	canceled bool
+}
+
+func (l *watchErrorLN) WatchInvoice([]byte) (*lnc.InvoiceState, error) {
+	return nil, errors.New("watch failed")
+}
+
+func (l *watchErrorLN) CancelInvoice([]byte) error {
+	l.canceled = true
+	return nil
+}
+
+func TestCircuitSwitchHandlesNilWatchResult(t *testing.T) {
+	ln := &watchErrorLN{fakeLN: &fakeLN{decoded: decodedWithFeatures("8")}}
+	r := NewRelay(ln)
+	r.WaitGroup.Add(1)
+	r.circuitSwitch([]byte("hash"), "lnbc1...", 1000)
+	if !ln.canceled {
+		t.Fatal("relay did not cancel after invoice watch failed")
+	}
 }
 
 func (m *recordingLN) DecodeInvoice(string) (*lnc.DecodedInvoice, error) { return m.decoded, nil }

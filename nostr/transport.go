@@ -86,6 +86,8 @@ const (
 	requestFreshness  = 5 * time.Minute
 	requestFutureSkew = time.Minute
 	maxSeenRequests   = 4096
+	maxRequestContent = 128 << 10
+	maxRequestTags    = 16
 )
 
 // NewTransport constructs a Transport. pool is usually a *gonostr.SimplePool.
@@ -169,9 +171,11 @@ func (t *Transport) Run(ctx context.Context) error {
 		log.Println("nostr: initial offer publish error:", err)
 	}
 
+	since := gonostr.Timestamp(t.now().Add(-requestFreshness).Unix())
 	sub := t.pool.SubscribeMany(runCtx, t.cfg.Relays, gonostr.Filter{
 		Kinds: []int{KindRequest},
 		Tags:  gonostr.TagMap{"p": []string{t.cfg.PublicKey}},
+		Since: &since,
 	})
 
 	ticker := time.NewTicker(t.cfg.OfferInterval)
@@ -190,6 +194,9 @@ func (t *Transport) Run(ctx context.Context) error {
 				return errors.New("nostr: subscription closed")
 			}
 			if ev.Event == nil {
+				continue
+			}
+			if !t.admitRequest(ev.Event) {
 				continue
 			}
 			select {
@@ -227,10 +234,10 @@ func (t *Transport) serveQueue(ctx context.Context, queue chan gonostr.RelayEven
 // verify its own announcement proof of work, nor any other provider's offer or
 // proof of work; ranking providers by proof of work and attestation is purely a
 // client concern.
-func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
-	if ok, err := evt.CheckSignature(); err != nil || !ok {
-		log.Println("nostr: bad request signature", evt.ID)
-		return
+func (t *Transport) admitRequest(evt *gonostr.Event) bool {
+	if evt == nil || len(evt.Content) > maxRequestContent || len(evt.Tags) > maxRequestTags {
+		log.Println("nostr: oversized request envelope")
+		return false
 	}
 	now := t.now()
 	createdAt := time.Unix(int64(evt.CreatedAt), 0)
@@ -239,21 +246,28 @@ func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
 		createdAt.After(now.Add(requestFutureSkew)) ||
 		!hasTagValue(evt.Tags, "p", t.cfg.PublicKey) {
 		log.Println("nostr: invalid request envelope", evt.ID)
-		return
-	}
-	// Enforce the request proof of work we advertise (DoS protection).
-	if err := nip13.Check(evt.ID, t.cfg.Offer.MinRequestPoW); err != nil {
-		log.Println("nostr: request below required proof of work", evt.ID)
-		return
-	}
-	if !t.markRequestSeen(evt.ID, now) {
-		log.Println("nostr: duplicate request event", evt.ID)
-		return
+		return false
 	}
 	if nip13.CommittedDifficulty(evt) < t.cfg.Offer.MinRequestPoW {
 		log.Println("nostr: request proof of work not committed to target", evt.ID)
-		return
+		return false
 	}
+	if err := nip13.Check(evt.ID, t.cfg.Offer.MinRequestPoW); err != nil {
+		log.Println("nostr: request below required proof of work", evt.ID)
+		return false
+	}
+	if ok, err := evt.CheckSignature(); err != nil || !ok {
+		log.Println("nostr: bad request signature", evt.ID)
+		return false
+	}
+	if !t.markRequestSeen(evt.ID, now) {
+		log.Println("nostr: duplicate request event", evt.ID)
+		return false
+	}
+	return true
+}
+
+func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
 
 	convKey, err := nip44.GenerateConversationKey(evt.PubKey, t.cfg.SecretKey)
 	if err != nil {

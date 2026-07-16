@@ -20,6 +20,9 @@ type Server struct {
 	// Offer is consulted for advertised features so unsupported wrap formats
 	// are rejected before touching the node.
 	Offer Offer
+	// ProviderPubkey binds direct requests to the identity that advertised the
+	// endpoint. It prevents a malicious offer from reflecting work at a victim.
+	ProviderPubkey string
 
 	mu       sync.Mutex
 	requests map[string]*requestResult
@@ -42,23 +45,30 @@ type requestResult struct {
 }
 
 // NewServer constructs a Server.
-func NewServer(r *relay.Relay, offer Offer) *Server {
+func NewServer(r *relay.Relay, offer Offer, providerPubkey ...string) *Server {
 	cacheTTL := time.Duration(offer.MaxExpirySeconds) * time.Second
 	if cacheTTL <= 0 {
 		cacheTTL = time.Hour
 	}
-	return &Server{
+	server := &Server{
 		Relay:    r,
 		Offer:    offer,
 		requests: make(map[string]*requestResult),
 		cacheTTL: cacheTTL,
 		now:      time.Now,
 	}
+	if len(providerPubkey) > 0 {
+		server.ProviderPubkey = providerPubkey[0]
+	}
+	return server
 }
 
 // Wrap validates the requested output format, opens a circuit, and returns the
 // proxy invoice or an error response.
 func (s *Server) Wrap(req Request) Response {
+	if s.ProviderPubkey != "" && req.ProviderPubkey != s.ProviderPubkey {
+		return Response{RequestID: req.RequestID, Status: "ERROR", Reason: "provider_pubkey mismatch"}
+	}
 	if req.RequestID == "" {
 		response, _ := s.wrap(req)
 		return response

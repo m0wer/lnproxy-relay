@@ -2,6 +2,8 @@ package relay
 
 import (
 	"fmt"
+	"math"
+	"math/bits"
 	"os"
 	"strconv"
 )
@@ -65,6 +67,12 @@ func (p RelayParameters) Validate() error {
 	if p.MaxAmountMsat < p.MinAmountMsat {
 		return fmt.Errorf("max amount (%d) must be >= min amount (%d)", p.MaxAmountMsat, p.MinAmountMsat)
 	}
+	if p.MaxExpiry == 0 {
+		return fmt.Errorf("max expiry must be greater than zero")
+	}
+	if _, err := p.effectiveFeeMsat(p.MaxAmountMsat); err != nil {
+		return fmt.Errorf("fee schedule overflows at max amount: %w", err)
+	}
 	return nil
 }
 
@@ -73,5 +81,37 @@ func (p RelayParameters) Validate() error {
 // wrap and is exposed so that the nostr layer can advertise it and so that
 // clients can be compared on a like-for-like basis.
 func (p RelayParameters) EffectiveFeeMsat(amount_msat uint64) uint64 {
-	return p.RoutingFeeBaseMsat + (amount_msat*p.RoutingFeePPM)/1_000_000
+	fee, err := p.effectiveFeeMsat(amount_msat)
+	if err != nil {
+		return math.MaxUint64
+	}
+	return fee
+}
+
+func (p RelayParameters) effectiveFeeMsat(amountMsat uint64) (uint64, error) {
+	proportional, err := checkedMulDiv(amountMsat, p.RoutingFeePPM, 1_000_000)
+	if err != nil {
+		return 0, err
+	}
+	return checkedAdd(p.RoutingFeeBaseMsat, proportional)
+}
+
+func checkedAdd(a, b uint64) (uint64, error) {
+	result, carry := bits.Add64(a, b, 0)
+	if carry != 0 {
+		return 0, fmt.Errorf("uint64 addition overflow")
+	}
+	return result, nil
+}
+
+func checkedMulDiv(a, b, divisor uint64) (uint64, error) {
+	if divisor == 0 {
+		return 0, fmt.Errorf("division by zero")
+	}
+	hi, lo := bits.Mul64(a, b)
+	if hi >= divisor {
+		return 0, fmt.Errorf("uint64 multiplication overflow")
+	}
+	quotient, _ := bits.Div64(hi, lo, divisor)
+	return quotient, nil
 }

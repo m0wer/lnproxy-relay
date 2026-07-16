@@ -279,7 +279,7 @@ func main() {
 	defer stopSignals()
 
 	pool := gonostr.NewSimplePool(ctx)
-	server := nostr.NewServer(lnproxyRelay, offer)
+	server := nostr.NewServer(lnproxyRelay, offer, identity.PublicKey)
 	transport := nostr.NewTransport(cfg, pool, server)
 	var directServer *http.Server
 	if httpListen != "" {
@@ -287,6 +287,7 @@ func main() {
 			Addr: httpListen,
 			Handler: httpapi.NewHandlerWithOptions(server, httpapi.Options{
 				RequireRequestID:   offer.HasFeature(nostr.FeatureRequestIDV1),
+				ProviderPubkey:     identity.PublicKey,
 				MaxConcurrent:      httpMaxConcurrent,
 				MinRequestInterval: httpRequestInterval,
 				RequestBurst:       httpRequestBurst,

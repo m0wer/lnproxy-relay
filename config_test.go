@@ -1,6 +1,9 @@
 package relay
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestEffectiveFeeMsat(t *testing.T) {
 	p := RelayParameters{RoutingFeeBaseMsat: 1000, RoutingFeePPM: 1000}
@@ -20,11 +23,13 @@ func TestValidate(t *testing.T) {
 		p       RelayParameters
 		wantErr bool
 	}{
-		{"ok", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000, MaxActiveCircuits: 1}, false},
-		{"zero min", RelayParameters{MinAmountMsat: 0, MaxAmountMsat: 2000, MaxActiveCircuits: 1}, true},
-		{"max below min", RelayParameters{MinAmountMsat: 2000, MaxAmountMsat: 1000, MaxActiveCircuits: 1}, true},
-		{"equal bounds", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 1000, MaxActiveCircuits: 1}, false},
-		{"omitted active circuit limit", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000}, false},
+		{"ok", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000, MaxExpiry: 3600, MaxActiveCircuits: 1}, false},
+		{"zero min", RelayParameters{MinAmountMsat: 0, MaxAmountMsat: 2000, MaxExpiry: 3600, MaxActiveCircuits: 1}, true},
+		{"max below min", RelayParameters{MinAmountMsat: 2000, MaxAmountMsat: 1000, MaxExpiry: 3600, MaxActiveCircuits: 1}, true},
+		{"zero max expiry", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000}, true},
+		{"overflowing fee", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: math.MaxUint64, MaxExpiry: 3600, RoutingFeePPM: math.MaxUint64}, true},
+		{"equal bounds", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 1000, MaxExpiry: 3600, MaxActiveCircuits: 1}, false},
+		{"omitted active circuit limit", RelayParameters{MinAmountMsat: 1000, MaxAmountMsat: 2000, MaxExpiry: 3600}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

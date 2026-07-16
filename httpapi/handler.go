@@ -18,6 +18,7 @@ const maxRequestBody = 64 << 10
 // Options controls direct HTTP admission policy.
 type Options struct {
 	RequireRequestID   bool
+	ProviderPubkey     string
 	MaxConcurrent      int
 	MinRequestInterval time.Duration
 	RequestBurst       int
@@ -77,6 +78,14 @@ func specHandler(wrapper Wrapper, options Options) http.Handler {
 		}
 		if options.RequireRequestID && request.RequestID == "" {
 			writeJSON(w, http.StatusOK, nostr.Response{Status: "ERROR", Reason: "request_id required"})
+			return
+		}
+		if options.ProviderPubkey != "" && request.ProviderPubkey != options.ProviderPubkey {
+			writeJSON(w, http.StatusOK, nostr.Response{
+				RequestID: request.RequestID,
+				Status:    "ERROR",
+				Reason:    "provider_pubkey mismatch",
+			})
 			return
 		}
 		if requestLimiter != nil && !requestLimiter.allow(time.Now()) {

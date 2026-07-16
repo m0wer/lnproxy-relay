@@ -11,6 +11,7 @@ import (
 type Request struct {
 	Method          string  `json:"method"`
 	RequestID       string  `json:"request_id,omitempty"`
+	ProviderPubkey  string  `json:"provider_pubkey,omitempty"`
 	Invoice         string  `json:"invoice"`
 	RoutingMsat     *uint64 `json:"routing_msat,string,omitempty"`
 	Description     *string `json:"description,omitempty"`

@@ -129,6 +129,35 @@ func TestHandlerCanRequireRequestID(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsMismatchedProviderBeforeAdmission(t *testing.T) {
+	requestID := strings.Repeat("a", 64)
+	wrapper := &recordingWrapper{}
+	handler := NewHandlerWithOptions(wrapper, Options{
+		ProviderPubkey:     strings.Repeat("b", 64),
+		MinRequestInterval: time.Hour,
+		RequestBurst:       1,
+	})
+
+	for range 2 {
+		body := `{"request_id":"` + requestID + `","provider_pubkey":"` + strings.Repeat("c", 64) + `","invoice":"lnbc1..."}`
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/spec", strings.NewReader(body)))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+		}
+		var response nostr.Response
+		if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.Status != "ERROR" || response.Reason != "provider_pubkey mismatch" || response.RequestID != requestID {
+			t.Fatalf("unexpected response: %+v", response)
+		}
+	}
+	if wrapper.request.Invoice != "" {
+		t.Fatal("mismatched provider request reached wrapper")
+	}
+}
+
 func TestHandlerBoundsConcurrentRequests(t *testing.T) {
 	wrapper := &blockingWrapper{started: make(chan struct{}), release: make(chan struct{})}
 	handler := NewHandlerWithOptions(wrapper, Options{MaxConcurrent: 1})

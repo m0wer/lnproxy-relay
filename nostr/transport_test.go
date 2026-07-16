@@ -270,6 +270,36 @@ func TestTransportDropsLowPoWRequest(t *testing.T) {
 	}
 }
 
+func TestTransportLowPoWRequestsDoNotDelayValidRequest(t *testing.T) {
+	handler := &countingWrapHandler{}
+	transport, pool, id := newTestTransport(t, handler)
+	transport.cfg.Offer.MinRequestPoW = 4
+	transport.cfg.RequestRateLimit = time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+
+	request := Request{Method: MethodWrap, Invoice: "lnbc1...", Wrap: "bolt11"}
+	for range 3 {
+		pool.incoming <- buildClientRequest(t, id.PublicKey, request, 0)
+	}
+	pool.incoming <- buildClientRequest(t, id.PublicKey, request, 4)
+
+	select {
+	case event := <-pool.published:
+		if event.Kind != KindResponse {
+			t.Fatalf("published kind = %d, want response", event.Kind)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("valid request was delayed by rejected low-pow traffic")
+	}
+	if got := handler.count(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+}
+
 func TestTransportDeduplicatesRequestEvents(t *testing.T) {
 	handler := &countingWrapHandler{}
 	transport, pool, id := newTestTransport(t, handler)
@@ -317,11 +347,12 @@ func TestTransportRejectsStaleAndMisaddressedRequests(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			handler := &countingWrapHandler{}
 			transport, pool, id := newTestTransport(t, handler)
+			event := test.build(t, transport, id)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			go transport.Run(ctx)
 			waitForPublished(t, pool, KindOffer)
-			pool.incoming <- test.build(t, transport, id)
+			pool.incoming <- event
 
 			select {
 			case event := <-pool.published:

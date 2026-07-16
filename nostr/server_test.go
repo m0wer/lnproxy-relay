@@ -121,6 +121,24 @@ func TestServerRejectsInvalidRequestID(t *testing.T) {
 	}
 }
 
+func TestServerRejectsMismatchedProviderPubkey(t *testing.T) {
+	ln := &idempotencyLN{}
+	provider := strings.Repeat("a", 64)
+	server := NewServer(relayForServerTest(ln), Offer{Features: []string{FeatureWrapBolt11}}, provider)
+	resp := server.Wrap(Request{
+		Method:         MethodWrap,
+		RequestID:      strings.Repeat("b", 64),
+		ProviderPubkey: strings.Repeat("c", 64),
+		Invoice:        "lnbc1...",
+	})
+	if resp.Status != "ERROR" || resp.Reason != "provider_pubkey mismatch" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if got := ln.calls(); got != 0 {
+		t.Fatalf("AddInvoice calls = %d, want 0", got)
+	}
+}
+
 func TestServerDoesNotEvictUnexpiredRequestIDs(t *testing.T) {
 	server := NewServer(relayForServerTest(&idempotencyLN{}), Offer{Features: []string{FeatureWrapBolt11}})
 	ready := make(chan struct{})
