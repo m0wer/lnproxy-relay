@@ -199,6 +199,30 @@ func TestHandlerRateLimitsDirectRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerRateLimitDoesNotLetOneSourceStarveOthers(t *testing.T) {
+	handler := NewHandlerWithOptions(&recordingWrapper{}, Options{
+		MinRequestInterval: time.Hour,
+		RequestBurst:       1,
+	})
+
+	request := func(remoteAddress, invoice string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/spec", strings.NewReader(`{"invoice":"`+invoice+`"}`))
+		req.RemoteAddr = remoteAddress
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+	if got := request("198.51.100.1:1000", "attacker-first").Code; got != http.StatusOK {
+		t.Fatalf("first attacker status = %d, want %d", got, http.StatusOK)
+	}
+	if got := request("198.51.100.1:1001", "attacker-second").Code; got != http.StatusTooManyRequests {
+		t.Fatalf("second attacker status = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if got := request("198.51.100.2:1000", "honest").Code; got != http.StatusOK {
+		t.Fatalf("honest source status = %d, want %d", got, http.StatusOK)
+	}
+}
+
 func TestTokenBucketRefillsWithoutLosingPartialTokens(t *testing.T) {
 	bucket := newTokenBucket(time.Second, 2)
 	now := time.Unix(1_700_000_000, 0)

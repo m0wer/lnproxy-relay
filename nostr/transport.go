@@ -143,10 +143,18 @@ func (t *Transport) publishOffer(ctx context.Context) error {
 		return err
 	}
 	results := t.pool.PublishMany(ctx, t.cfg.Relays, *evt)
-	for range results {
-		// drain; individual relay failures are non-fatal
+	successes := 0
+	for result := range results {
+		if result.Error != nil {
+			log.Printf("nostr: offer publish to %s failed: %v", result.RelayURL, result.Error)
+			continue
+		}
+		successes++
 	}
-	log.Printf("nostr: published offer %s to %d relays", evt.ID, len(t.cfg.Relays))
+	if successes == 0 && len(t.cfg.Relays) > 0 {
+		return errors.New("nostr: offer publication failed on every relay")
+	}
+	log.Printf("nostr: published offer %s to %d relays", evt.ID, successes)
 	return nil
 }
 
@@ -215,7 +223,7 @@ func (t *Transport) serveQueue(ctx context.Context, queue chan gonostr.RelayEven
 		case <-ctx.Done():
 			return
 		case ev := <-queue:
-			t.handleRequest(ctx, ev.Event)
+			t.handleRequest(ctx, ev)
 			select {
 			case <-ctx.Done():
 				return
@@ -267,7 +275,8 @@ func (t *Transport) admitRequest(evt *gonostr.Event) bool {
 	return true
 }
 
-func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
+func (t *Transport) handleRequest(ctx context.Context, relayEvent gonostr.RelayEvent) {
+	evt := relayEvent.Event
 
 	convKey, err := nip44.GenerateConversationKey(evt.PubKey, t.cfg.SecretKey)
 	if err != nil {
@@ -281,12 +290,12 @@ func (t *Transport) handleRequest(ctx context.Context, evt *gonostr.Event) {
 	}
 	var req Request
 	if err := json.Unmarshal([]byte(plaintext), &req); err != nil {
-		t.reply(ctx, evt, convKey, errorResponse("bad request"))
+		t.reply(ctx, relayEvent, convKey, errorResponse("bad request"))
 		return
 	}
 
 	resp := t.handler.Wrap(req)
-	t.reply(ctx, evt, convKey, resp)
+	t.reply(ctx, relayEvent, convKey, resp)
 }
 
 func hasTagValue(tags gonostr.Tags, name, value string) bool {
@@ -320,7 +329,8 @@ func (t *Transport) markRequestSeen(id string, now time.Time) bool {
 
 // reply encrypts resp and publishes it as a kind 21822 response addressed to the
 // requester.
-func (t *Transport) reply(ctx context.Context, reqEvt *gonostr.Event, convKey [32]byte, resp Response) {
+func (t *Transport) reply(ctx context.Context, relayEvent gonostr.RelayEvent, convKey [32]byte, resp Response) {
+	reqEvt := relayEvent.Event
 	plaintext, err := MarshalResponse(resp)
 	if err != nil {
 		log.Println("nostr: marshal response error", err)
@@ -354,7 +364,19 @@ func (t *Transport) reply(ctx context.Context, reqEvt *gonostr.Event, convKey [3
 		log.Println("nostr: sign response error", err)
 		return
 	}
-	results := t.pool.PublishMany(ctx, t.cfg.Relays, evt)
-	for range results {
+	targetRelays := t.cfg.Relays
+	if relayEvent.Relay != nil && relayEvent.Relay.URL != "" {
+		for _, configured := range t.cfg.Relays {
+			if relayEvent.Relay.URL == configured {
+				targetRelays = []string{configured}
+				break
+			}
+		}
+	}
+	results := t.pool.PublishMany(ctx, targetRelays, evt)
+	for result := range results {
+		if result.Error != nil {
+			log.Printf("nostr: response publish to %s failed: %v", result.RelayURL, result.Error)
+		}
 	}
 }

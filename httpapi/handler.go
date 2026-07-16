@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -47,7 +48,8 @@ func specHandler(wrapper Wrapper, options Options) http.Handler {
 	if options.MaxConcurrent > 0 {
 		admission = make(chan struct{}, options.MaxConcurrent)
 	}
-	requestLimiter := newTokenBucket(options.MinRequestInterval, options.RequestBurst)
+	sourceLimiters := newSourceTokenBuckets(options.MinRequestInterval, options.RequestBurst, 256)
+	globalLimiter := newTokenBucket(options.MinRequestInterval/16, options.RequestBurst*16)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -63,6 +65,15 @@ func specHandler(wrapper Wrapper, options Options) http.Handler {
 			w.Header().Set("Allow", "POST, OPTIONS")
 			writeJSON(w, http.StatusMethodNotAllowed, nostr.Response{Status: "ERROR", Reason: "method not allowed"})
 			return
+		}
+		if admission != nil {
+			select {
+			case admission <- struct{}{}:
+				defer func() { <-admission }()
+			default:
+				writeJSON(w, http.StatusServiceUnavailable, nostr.Response{Status: "ERROR", Reason: "server busy"})
+				return
+			}
 		}
 
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
@@ -88,24 +99,63 @@ func specHandler(wrapper Wrapper, options Options) http.Handler {
 			})
 			return
 		}
-		if requestLimiter != nil && !requestLimiter.allow(time.Now()) {
+		now := time.Now()
+		if sourceLimiters != nil && !sourceLimiters.allow(clientAddress(r), now) {
 			retryAfter := int(math.Ceil(options.MinRequestInterval.Seconds()))
 			w.Header().Set("Retry-After", strconv.Itoa(max(retryAfter, 1)))
 			writeJSON(w, http.StatusTooManyRequests, nostr.Response{Status: "ERROR", Reason: "rate limit exceeded"})
 			return
 		}
-		if admission != nil {
-			select {
-			case admission <- struct{}{}:
-				defer func() { <-admission }()
-			default:
-				writeJSON(w, http.StatusServiceUnavailable, nostr.Response{Status: "ERROR", Reason: "server busy"})
-				return
-			}
+		if globalLimiter != nil && !globalLimiter.allow(now) {
+			retryAfter := int(math.Ceil(options.MinRequestInterval.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(max(retryAfter, 1)))
+			writeJSON(w, http.StatusTooManyRequests, nostr.Response{Status: "ERROR", Reason: "rate limit exceeded"})
+			return
 		}
-
 		writeJSON(w, http.StatusOK, wrapper.Wrap(request))
 	})
+}
+
+func clientAddress(request *http.Request) string {
+	addressPort, err := netip.ParseAddrPort(request.RemoteAddr)
+	if err == nil {
+		return addressPort.Addr().Unmap().String()
+	}
+	return request.RemoteAddr
+}
+
+type sourceTokenBuckets struct {
+	mu       sync.Mutex
+	buckets  []*tokenBucket
+	interval time.Duration
+	burst    int
+}
+
+func newSourceTokenBuckets(interval time.Duration, burst, count int) *sourceTokenBuckets {
+	if interval <= 0 || burst <= 0 || count <= 0 {
+		return nil
+	}
+	return &sourceTokenBuckets{
+		buckets:  make([]*tokenBucket, count),
+		interval: interval,
+		burst:    burst,
+	}
+}
+
+func (b *sourceTokenBuckets) allow(source string, now time.Time) bool {
+	var hash uint64 = 14695981039346656037
+	for i := 0; i < len(source); i++ {
+		hash ^= uint64(source[i])
+		hash *= 1099511628211
+	}
+	index := int(hash % uint64(len(b.buckets)))
+	b.mu.Lock()
+	if b.buckets[index] == nil {
+		b.buckets[index] = newTokenBucket(b.interval, b.burst)
+	}
+	bucket := b.buckets[index]
+	b.mu.Unlock()
+	return bucket.allow(now)
 }
 
 type tokenBucket struct {

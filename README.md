@@ -78,7 +78,7 @@ built-in default):
 | `-max-msat` | `LNPROXY_MAX_MSAT` | maximum invoice amount (msat) |
 | `-base-fee-msat` | `LNPROXY_BASE_FEE_MSAT` | relay base fee (msat) |
 | `-fee-ppm` | `LNPROXY_FEE_PPM` | relay proportional fee (ppm) |
-| `-max-expiry` | `LNPROXY_MAX_EXPIRY` | maximum proxy invoice expiry (seconds) |
+| `-max-expiry` | `LNPROXY_MAX_EXPIRY` | maximum proxy invoice expiry (seconds, default 3600) |
 | `-max-active-circuits` | `LNPROXY_MAX_ACTIVE_CIRCUITS` | maximum concurrent hold-invoice circuits (default 128) |
 
 For example, to cap proxied amounts at 500,000 sats and charge 0.2%:

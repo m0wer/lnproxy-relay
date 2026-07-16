@@ -64,8 +64,9 @@ func validDecodedInvoice() *lnc.DecodedInvoice {
 // fakePool implements Pool for tests: SubscribeMany returns a channel the test
 // feeds, PublishMany records published events.
 type fakePool struct {
-	incoming  chan gonostr.RelayEvent
-	published chan *gonostr.Event
+	incoming      chan gonostr.RelayEvent
+	published     chan *gonostr.Event
+	publishedURLs chan []string
 }
 
 type countingWrapHandler struct {
@@ -88,8 +89,9 @@ func (h *countingWrapHandler) count() int {
 
 func newFakePool() *fakePool {
 	return &fakePool{
-		incoming:  make(chan gonostr.RelayEvent, 4),
-		published: make(chan *gonostr.Event, 16),
+		incoming:      make(chan gonostr.RelayEvent, 4),
+		published:     make(chan *gonostr.Event, 16),
+		publishedURLs: make(chan []string, 16),
 	}
 }
 
@@ -100,9 +102,33 @@ func (p *fakePool) SubscribeMany(ctx context.Context, urls []string, filter gono
 func (p *fakePool) PublishMany(ctx context.Context, urls []string, evt gonostr.Event) chan gonostr.PublishResult {
 	e := evt
 	p.published <- &e
-	ch := make(chan gonostr.PublishResult)
+	p.publishedURLs <- append([]string(nil), urls...)
+	ch := make(chan gonostr.PublishResult, len(urls))
+	for _, url := range urls {
+		ch <- gonostr.PublishResult{RelayURL: url}
+	}
 	close(ch)
 	return ch
+}
+
+func TestTransportRepliesOnlyThroughSourceRelay(t *testing.T) {
+	handler := &countingWrapHandler{}
+	transport, pool, id := newTestTransport(t, handler)
+	transport.cfg.Relays = []string{"wss://one.example", "wss://two.example"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+	<-pool.publishedURLs
+
+	event := buildClientRequest(t, id.PublicKey, Request{Method: MethodWrap, Invoice: "lnbc1..."}, 0)
+	event.Relay = &gonostr.Relay{URL: "wss://two.example"}
+	pool.incoming <- event
+	waitForPublished(t, pool, KindResponse)
+	if got := <-pool.publishedURLs; len(got) != 1 || got[0] != "wss://two.example" {
+		t.Fatalf("response relays = %v, want source relay only", got)
+	}
 }
 
 func newTestTransport(t *testing.T, handler WrapHandler) (*Transport, *fakePool, Identity) {

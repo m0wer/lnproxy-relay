@@ -52,7 +52,7 @@ func NewRelay(ln lnc.LN) *Relay {
 			MinAmountMsat:      10_000,
 			MaxAmountMsat:      1_000_000_000,
 			ExpiryBuffer:       300,
-			MaxExpiry:          604800, // 60*60*24*7 one week
+			MaxExpiry:          3600,
 			MaxActiveCircuits:  defaultMaxActiveCircuits,
 			MinFeeBudgetMsat:   1000,
 			RoutingBudgetAlpha: 1000,

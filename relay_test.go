@@ -72,6 +72,13 @@ func TestWrapAcceptsBlindedPathFeatures(t *testing.T) {
 	}
 }
 
+func TestNewRelayBoundsDefaultProxyExpiry(t *testing.T) {
+	r := NewRelay(nil)
+	if r.MaxExpiry != uint64(time.Hour.Seconds()) {
+		t.Fatalf("MaxExpiry = %d, want %d", r.MaxExpiry, uint64(time.Hour.Seconds()))
+	}
+}
+
 func TestWrapRejectsUnknownFeature(t *testing.T) {
 	r := NewRelay(&fakeLN{decoded: decodedWithFeatures("8", "999")})
 	_, _, err := r.wrap(ProxyParameters{Invoice: "lnbcrt1..."})

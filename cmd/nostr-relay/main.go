@@ -317,8 +317,15 @@ func main() {
 	transportDone := make(chan struct{})
 	go func() {
 		defer close(transportDone)
-		if err := transport.Run(ctx); err != nil && ctx.Err() == nil {
-			errCh <- fmt.Errorf("nostr transport: %w", err)
+		for ctx.Err() == nil {
+			if err := transport.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Println("nostr transport stopped, retrying in 5s:", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
 		}
 	}()
 
