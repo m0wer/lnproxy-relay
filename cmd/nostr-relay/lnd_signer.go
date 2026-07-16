@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/lnproxy/lnc"
@@ -44,7 +47,11 @@ func (s *lndSigner) IdentityPubkey() (string, error) {
 	if response.IdentityPubkey == "" {
 		return "", errors.New("v1/getinfo: empty identity_pubkey")
 	}
-	return response.IdentityPubkey, nil
+	pubkey, err := hex.DecodeString(response.IdentityPubkey)
+	if err != nil || len(pubkey) != 33 || (pubkey[0] != 2 && pubkey[0] != 3) {
+		return "", errors.New("v1/getinfo: invalid identity_pubkey")
+	}
+	return strings.ToLower(response.IdentityPubkey), nil
 }
 
 func (s *lndSigner) SignMessage(message []byte) (string, error) {
@@ -65,13 +72,30 @@ func (s *lndSigner) SignMessage(message []byte) (string, error) {
 	if err := s.do(req, &response); err != nil {
 		return "", err
 	}
-	if response.Signature == "" {
-		return "", errors.New("v1/signmessage: empty signature")
+	const zbase32Alphabet = "ybndrfg8ejkmcpqxot1uwisza345h769"
+	if len(response.Signature) != 104 {
+		return "", errors.New("v1/signmessage: invalid signature length")
+	}
+	for _, char := range response.Signature {
+		if !strings.ContainsRune(zbase32Alphabet, char) {
+			return "", errors.New("v1/signmessage: invalid zbase32 signature")
+		}
 	}
 	return response.Signature, nil
 }
 
 func (s *lndSigner) request(method, path string, body io.Reader) (*http.Request, error) {
+	if s.lnd == nil || s.lnd.Host == nil || s.lnd.Client == nil {
+		return nil, errors.New("lnd host and client are required")
+	}
+	hostname := strings.ToLower(s.lnd.Host.Hostname())
+	loopback := hostname == "localhost" || strings.HasSuffix(hostname, ".localhost")
+	if ip := net.ParseIP(hostname); ip != nil {
+		loopback = ip.IsLoopback()
+	}
+	if s.lnd.Host.Scheme != "https" && !(s.lnd.Host.Scheme == "http" && loopback) {
+		return nil, errors.New("authenticated lnd REST requests require HTTPS or a loopback HTTP endpoint")
+	}
 	req, err := http.NewRequest(method, s.lnd.Host.JoinPath(path).String(), body)
 	if err != nil {
 		return nil, err
@@ -91,19 +115,38 @@ func (s *lndSigner) do(req *http.Request, response any) error {
 		defer cancel()
 	}
 	req = req.WithContext(ctx)
-	resp, err := s.lnd.Client.Do(req)
+	client := *s.lnd.Client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, (4<<10)+1))
 		if readErr != nil {
 			return readErr
 		}
 		return fmt.Errorf("%s: HTTP %d: %s", req.URL.Path, resp.StatusCode, string(body))
 	}
-	if err := json.NewDecoder(resp.Body).Decode(response); err != nil && err != io.EOF {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (16<<10)+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > 16<<10 {
+		return errors.New("lnd attestation response too large")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(response); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("lnd attestation response contains multiple JSON values")
+		}
 		return err
 	}
 	return nil

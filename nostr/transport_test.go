@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,9 +66,11 @@ func validDecodedInvoice() *lnc.DecodedInvoice {
 // fakePool implements Pool for tests: SubscribeMany returns a channel the test
 // feeds, PublishMany records published events.
 type fakePool struct {
-	incoming      chan gonostr.RelayEvent
-	published     chan *gonostr.Event
-	publishedURLs chan []string
+	incoming        chan gonostr.RelayEvent
+	published       chan *gonostr.Event
+	publishedURLs   chan []string
+	publishMu       sync.Mutex
+	publishFailures map[string]bool
 }
 
 type countingWrapHandler struct {
@@ -89,9 +93,10 @@ func (h *countingWrapHandler) count() int {
 
 func newFakePool() *fakePool {
 	return &fakePool{
-		incoming:      make(chan gonostr.RelayEvent, 4),
-		published:     make(chan *gonostr.Event, 16),
-		publishedURLs: make(chan []string, 16),
+		incoming:        make(chan gonostr.RelayEvent, 4),
+		published:       make(chan *gonostr.Event, 16),
+		publishedURLs:   make(chan []string, 16),
+		publishFailures: make(map[string]bool),
 	}
 }
 
@@ -105,10 +110,22 @@ func (p *fakePool) PublishMany(ctx context.Context, urls []string, evt gonostr.E
 	p.publishedURLs <- append([]string(nil), urls...)
 	ch := make(chan gonostr.PublishResult, len(urls))
 	for _, url := range urls {
-		ch <- gonostr.PublishResult{RelayURL: url}
+		result := gonostr.PublishResult{RelayURL: url}
+		p.publishMu.Lock()
+		if p.publishFailures[url] {
+			result.Error = errors.New("publish failed")
+		}
+		p.publishMu.Unlock()
+		ch <- result
 	}
 	close(ch)
 	return ch
+}
+
+func (p *fakePool) setPublishFailure(url string) {
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+	p.publishFailures[url] = true
 }
 
 func TestTransportRepliesOnlyThroughSourceRelay(t *testing.T) {
@@ -128,6 +145,48 @@ func TestTransportRepliesOnlyThroughSourceRelay(t *testing.T) {
 	waitForPublished(t, pool, KindResponse)
 	if got := <-pool.publishedURLs; len(got) != 1 || got[0] != "wss://two.example" {
 		t.Fatalf("response relays = %v, want source relay only", got)
+	}
+}
+
+func TestTransportFallsBackAfterSourceRelayPublishFailure(t *testing.T) {
+	handler := &countingWrapHandler{}
+	transport, pool, id := newTestTransport(t, handler)
+	transport.cfg.Relays = []string{"wss://one.example", "wss://two.example"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go transport.Run(ctx)
+	waitForPublished(t, pool, KindOffer)
+	<-pool.publishedURLs
+	pool.setPublishFailure("wss://one.example")
+
+	event := buildClientRequest(t, id.PublicKey, Request{Method: MethodWrap, Invoice: "lnbc1..."}, 0)
+	event.Relay = &gonostr.Relay{URL: "wss://one.example"}
+	pool.incoming <- event
+	waitForPublished(t, pool, KindResponse)
+	if got := <-pool.publishedURLs; len(got) != 1 || got[0] != "wss://one.example" {
+		t.Fatalf("first response relays = %v, want source", got)
+	}
+	waitForPublished(t, pool, KindResponse)
+	if got := <-pool.publishedURLs; len(got) != 1 || got[0] != "wss://two.example" {
+		t.Fatalf("fallback response relays = %v, want alternate", got)
+	}
+}
+
+func TestTransportRejectsOversizedAndDuplicateRequestTags(t *testing.T) {
+	transport, _, id := newTestTransport(t, &countingWrapHandler{})
+	request := Request{Method: MethodWrap, Invoice: "lnbc1..."}
+
+	oversized := buildClientRequest(t, id.PublicKey, request, 0)
+	oversized.Tags = append(oversized.Tags, gonostr.Tag{"x", strings.Repeat("a", maxRequestTagBytes)})
+	if transport.admitRequest(oversized.Event) {
+		t.Fatal("oversized request tags were admitted")
+	}
+
+	duplicateNonce := buildClientRequest(t, id.PublicKey, request, 0)
+	duplicateNonce.Tags = append(duplicateNonce.Tags, gonostr.Tag{"nonce", "1", "0"})
+	if transport.admitRequest(duplicateNonce.Event) {
+		t.Fatal("duplicate nonce tags were admitted")
 	}
 }
 
@@ -163,7 +222,7 @@ func newTestTransport(t *testing.T, handler WrapHandler) (*Transport, *fakePool,
 		Relays:            []string{"wss://example"},
 		Network:           Regtest,
 		Offer:             Offer{MinRequestPoW: 0, Features: []string{FeatureWrapBolt11}},
-		AnnouncePoWTarget: 0,
+		AnnouncePoWTarget: -1,
 		RequestRateLimit:  time.Millisecond,
 	}
 	transport := NewTransport(cfg, pool, handler)
@@ -207,6 +266,8 @@ func buildClientRequest(t *testing.T, providerPub string, req Request, powTarget
 			t.Fatalf("client pow: %v", err)
 		}
 		evt.Tags = append(evt.Tags, nonceTag)
+	} else {
+		evt.Tags = append(evt.Tags, gonostr.Tag{"nonce", "0", "0"})
 	}
 	if err := evt.Sign(clientSK); err != nil {
 		t.Fatalf("sign: %v", err)

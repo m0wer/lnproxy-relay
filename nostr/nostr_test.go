@@ -1,6 +1,7 @@
 package nostr
 
 import (
+	"math"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -90,6 +91,9 @@ func TestOfferHelpers(t *testing.T) {
 	}
 	if got := o.EffectiveFeeMsat(1_000_000); got != 2000 {
 		t.Errorf("EffectiveFeeMsat = %d, want 2000", got)
+	}
+	if got := (Offer{BaseFeeMsat: math.MaxUint64, FeePPM: math.MaxUint64}).EffectiveFeeMsat(math.MaxUint64); got != math.MaxUint64 {
+		t.Errorf("overflowing EffectiveFeeMsat = %d, want saturation", got)
 	}
 	if !o.HasFeature(FeatureWrapBolt11) {
 		t.Error("expected HasFeature(wrap_bolt11) true")

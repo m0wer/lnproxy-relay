@@ -86,11 +86,13 @@ type Transport struct {
 }
 
 const (
-	requestFreshness  = 5 * time.Minute
-	requestFutureSkew = time.Minute
-	maxSeenRequests   = 4096
-	maxRequestContent = 128 << 10
-	maxRequestTags    = 16
+	requestFreshness   = 5 * time.Minute
+	requestFutureSkew  = time.Minute
+	maxSeenRequests    = 4096
+	maxRequestContent  = 128 << 10
+	maxRequestTags     = 16
+	maxRequestTagBytes = 4 << 10
+	maxRequestTagItems = 8
 )
 
 // NewTransport constructs a Transport. pool is usually a *gonostr.SimplePool.
@@ -249,7 +251,7 @@ func (t *Transport) serveQueue(ctx context.Context, queue chan gonostr.RelayEven
 // proof of work; ranking providers by proof of work and attestation is purely a
 // client concern.
 func (t *Transport) admitRequest(evt *gonostr.Event) bool {
-	if evt == nil || len(evt.Content) > maxRequestContent || len(evt.Tags) > maxRequestTags {
+	if !requestEnvelopeWithinBounds(evt) {
 		log.Println("nostr: oversized request envelope")
 		return false
 	}
@@ -279,6 +281,33 @@ func (t *Transport) admitRequest(evt *gonostr.Event) bool {
 		return false
 	}
 	return true
+}
+
+func requestEnvelopeWithinBounds(evt *gonostr.Event) bool {
+	if evt == nil || len(evt.ID) != 64 || len(evt.PubKey) != 64 || len(evt.Sig) != 128 ||
+		len(evt.Content) > maxRequestContent || len(evt.Tags) > maxRequestTags {
+		return false
+	}
+	totalTagBytes := 0
+	nonceTags := 0
+	for _, tag := range evt.Tags {
+		if len(tag) == 0 || len(tag) > maxRequestTagItems {
+			return false
+		}
+		if tag[0] == "nonce" {
+			nonceTags++
+			if len(tag) != 3 {
+				return false
+			}
+		}
+		for _, item := range tag {
+			totalTagBytes += len(item)
+			if totalTagBytes > maxRequestTagBytes {
+				return false
+			}
+		}
+	}
+	return nonceTags == 1
 }
 
 func (t *Transport) handleRequest(ctx context.Context, relayEvent gonostr.RelayEvent) {
@@ -379,10 +408,30 @@ func (t *Transport) reply(ctx context.Context, relayEvent gonostr.RelayEvent, co
 			}
 		}
 	}
-	results := t.pool.PublishMany(ctx, targetRelays, evt)
-	for result := range results {
-		if result.Error != nil {
-			log.Printf("nostr: response publish to %s failed: %v", result.RelayURL, result.Error)
+	if t.publishResponse(ctx, targetRelays, evt) {
+		return
+	}
+	if len(targetRelays) == 1 {
+		fallback := make([]string, 0, len(t.cfg.Relays)-1)
+		for _, configured := range t.cfg.Relays {
+			if configured != targetRelays[0] {
+				fallback = append(fallback, configured)
+			}
+		}
+		if len(fallback) > 0 {
+			t.publishResponse(ctx, fallback, evt)
 		}
 	}
+}
+
+func (t *Transport) publishResponse(ctx context.Context, relays []string, evt gonostr.Event) bool {
+	success := false
+	for result := range t.pool.PublishMany(ctx, relays, evt) {
+		if result.Error != nil {
+			log.Printf("nostr: response publish to %s failed: %v", result.RelayURL, result.Error)
+			continue
+		}
+		success = true
+	}
+	return success
 }

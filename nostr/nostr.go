@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 )
 
@@ -86,7 +87,16 @@ type Offer struct {
 // EffectiveFeeMsat returns the provider's advertised fee for proxying an
 // invoice of amount_msat, used by clients to sort offers cheapest-first.
 func (o Offer) EffectiveFeeMsat(amount_msat uint64) uint64 {
-	return o.BaseFeeMsat + (amount_msat*o.FeePPM)/1_000_000
+	hi, lo := bits.Mul64(amount_msat, o.FeePPM)
+	if hi >= 1_000_000 {
+		return math.MaxUint64
+	}
+	proportional, _ := bits.Div64(hi, lo, 1_000_000)
+	fee, carry := bits.Add64(o.BaseFeeMsat, proportional, 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return fee
 }
 
 // HasFeature reports whether the offer advertises the given feature flag.

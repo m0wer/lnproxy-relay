@@ -7,10 +7,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lnproxy/lnc"
+)
+
+var (
+	testNodePubkey    = "02" + strings.Repeat("ab", 32)
+	testNodeSignature = strings.Repeat("y", 104)
 )
 
 func testSigner(t *testing.T, handler http.HandlerFunc) *lndSigner {
@@ -37,15 +43,15 @@ func TestLNDSignerIdentityPubkey(t *testing.T) {
 		if got := req.Header.Get("Grpc-Metadata-macaroon"); got != "test-macaroon" {
 			t.Errorf("macaroon = %q, want test-macaroon", got)
 		}
-		json.NewEncoder(w).Encode(map[string]string{"identity_pubkey": "02abc"})
+		json.NewEncoder(w).Encode(map[string]string{"identity_pubkey": testNodePubkey})
 	})
 
 	pubkey, err := signer.IdentityPubkey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pubkey != "02abc" {
-		t.Fatalf("pubkey = %q, want 02abc", pubkey)
+	if pubkey != testNodePubkey {
+		t.Fatalf("pubkey = %q, want %q", pubkey, testNodePubkey)
 	}
 }
 
@@ -64,15 +70,15 @@ func TestLNDSignerSignMessage(t *testing.T) {
 		if body.Message != base64.StdEncoding.EncodeToString(message) {
 			t.Errorf("message = %q, want base64 payload", body.Message)
 		}
-		json.NewEncoder(w).Encode(map[string]string{"signature": "signed"})
+		json.NewEncoder(w).Encode(map[string]string{"signature": testNodeSignature})
 	})
 
 	signature, err := signer.SignMessage(message)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signature != "signed" {
-		t.Fatalf("signature = %q, want signed", signature)
+	if signature != testNodeSignature {
+		t.Fatalf("signature = %q, want valid signature", signature)
 	}
 }
 
